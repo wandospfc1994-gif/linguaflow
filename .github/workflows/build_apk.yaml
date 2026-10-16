@@ -23,6 +23,7 @@ jobs:
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
       KS_PASS: ${{ secrets.KS_PASS }}
       KS_ALIAS: ${{ secrets.KS_ALIAS }}
+      GRADLE_OPTS: "-Djava.awt.headless=true -Dfile.encoding=UTF-8"
 
     steps:
       - name: Checkout do Repositório
