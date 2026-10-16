@@ -1,4 +1,5 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.util.Base64
 
 plugins {
   alias(libs.plugins.android.application)
@@ -32,14 +33,31 @@ android {
   // and updating Android apps in AI Studio.
   signingConfigs {
     create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
+      val releaseKeystore = file("${rootDir}/app/release.keystore")
+      val keystorePath = System.getenv("KEYSTORE_PATH")
+        ?: if (releaseKeystore.exists()) releaseKeystore.absolutePath else "${rootDir}/my-upload-key.jks"
       storeFile = file(keystorePath)
-      storePassword = System.getenv("STORE_PASSWORD")
-      keyAlias = "upload"
-      keyPassword = System.getenv("KEY_PASSWORD")
+      storePassword = System.getenv("KS_PASS") ?: System.getenv("STORE_PASSWORD")
+      keyAlias = System.getenv("KS_ALIAS") ?: "upload"
+      keyPassword = System.getenv("KS_PASS") ?: System.getenv("KEY_PASSWORD")
     }
     create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
+      var debugFile = file("${rootDir}/debug.keystore")
+      if (!debugFile.exists()) {
+        val b64File = file("${rootDir}/debug.keystore.base64")
+        if (b64File.exists()) {
+          runCatching {
+            debugFile.writeBytes(Base64.getDecoder().decode(b64File.readText().trim()))
+          }
+        }
+      }
+      if (!debugFile.exists()) {
+        val userDebug = file("${System.getProperty("user.home")}/.android/debug.keystore")
+        if (userDebug.exists()) {
+          debugFile = userDebug
+        }
+      }
+      storeFile = debugFile
       storePassword = "android"
       keyAlias = "androiddebugkey"
       keyPassword = "android"
