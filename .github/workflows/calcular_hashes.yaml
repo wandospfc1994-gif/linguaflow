@@ -1,0 +1,23 @@
+name: Calcular hash de modelo
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: URL direta do arquivo (https)
+        required: true
+
+jobs:
+  hash:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar e calcular
+        env:
+          URL: ${{ github.event.inputs.url }}
+        run: |
+          curl -fL --retry 3 -o modelo.bin "$URL"
+          {
+            echo "### Resultado"
+            echo "URL: $URL"
+            echo "Tamanho (bytes): $(stat -c %s modelo.bin)"
+            echo "SHA-256: $(sha256sum modelo.bin | cut -d' ' -f1)"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,6 @@
+{
+  "name": "Linguaflow AI",
+  "description": "Linguaflow AI - Tutor com Whisper STT e Piper TTS via sherpa-onnx, CEFR A1 a C1 e Desafios Diários",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
