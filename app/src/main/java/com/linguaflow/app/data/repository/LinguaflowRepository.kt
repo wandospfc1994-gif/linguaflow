@@ -126,6 +126,40 @@ class LinguaflowRepository(
         userStatsDao.addWordsLearned(wordsLearned)
     }
 
+    suspend fun savePreferences(targetLang: String, level: String, dailyMinutes: Int) {
+        val currentProgress = progressDao.getProgressDirect()
+        val (_, nextLevelXp) = CourseTrack.calculateLevelForXp(currentProgress?.currentXp ?: 50)
+        if (currentProgress != null) {
+            progressDao.upsertProgress(
+                currentProgress.copy(
+                    currentLevel = level,
+                    nextLevelXp = nextLevelXp
+                )
+            )
+        } else {
+            progressDao.upsertProgress(
+                ProgressEntity(
+                    id = 1,
+                    currentLevel = level,
+                    currentXp = 50,
+                    nextLevelXp = nextLevelXp,
+                    streakDays = 1,
+                    completedChallenges = 0,
+                    lastActiveDate = getTodayDateString()
+                )
+            )
+        }
+        val conv = conversationDao.getConversationById(1L).firstOrNull()
+        if (conv != null) {
+            conversationDao.insertConversation(
+                conv.copy(
+                    targetLanguage = targetLang,
+                    userLevel = level
+                )
+            )
+        }
+    }
+
     fun getStats(): Flow<UserStatsEntity?> = userStatsDao.getStats()
 
     suspend fun initStatsIfNeeded() {

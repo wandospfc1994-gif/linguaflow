@@ -15,7 +15,8 @@ data class ModelInfo(
     val approximateSizeBytes: Long,
     val expectedSha256: String,
     val description: String,
-    val isRequired: Boolean = true
+    val isRequired: Boolean = true,
+    val requiresAuth: Boolean = false
 ) {
     val formattedSize: String
         get() {
@@ -35,6 +36,14 @@ sealed class ModelDownloadState {
         val downloadedBytes: Long,
         val totalBytes: Long,
         val speedText: String = ""
+    ) : ModelDownloadState()
+    data class Paused(
+        val downloadedBytes: Long,
+        val totalBytes: Long
+    ) : ModelDownloadState()
+    data class RequiresAuth(
+        val modelId: String,
+        val message: String = "Autenticação ou Token do Hugging Face necessário para baixar este modelo"
     ) : ModelDownloadState()
     data class Verifying(val message: String = "Verificando integridade SHA-256...") : ModelDownloadState()
     data class Installed(val fileSizeBytes: Long) : ModelDownloadState()
