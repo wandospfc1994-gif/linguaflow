@@ -222,9 +222,10 @@ class ModelDownloadManager(
         updateState(model.id, ModelDownloadState.NotInstalled)
     }
 
-    private suspend fun downloadInternal(model: ModelInfo) = withContext(Dispatchers.IO) {
-        val targetFile = getModelFile(model)
-        val partFile = getPartFile(model)
+    private suspend fun downloadInternal(model: ModelInfo): Unit = withContext(Dispatchers.IO) {
+        var activeModel = model
+        val targetFile = getModelFile(activeModel)
+        val partFile = getPartFile(activeModel)
 
         val maxRetries = 5
         var attempt = 0
@@ -236,29 +237,30 @@ class ModelDownloadManager(
                 val existingBytes = if (partFile.exists()) partFile.length() else 0L
 
                 // Se já estiver completo
-                if (existingBytes > 0 && model.approximateSizeBytes > 0 && existingBytes >= model.approximateSizeBytes) {
+                if (existingBytes > 0 && activeModel.approximateSizeBytes > 0 && existingBytes >= activeModel.approximateSizeBytes) {
                     isCompleted = true
                     break
                 }
 
                 val requestBuilder = Request.Builder()
-                    .url(model.url)
+                    .url(activeModel.url)
                     .header("User-Agent", "Linguaflow-Android/1.0")
 
                 if (existingBytes > 0) {
                     requestBuilder.header("Range", "bytes=$existingBytes-")
                 }
 
-                // Injeta Cookies e Bearer Token para URLs da Hugging Face
-                if (model.url.contains("huggingface.co")) {
+                // SOMENTE adiciona Authorization ou Cookies se o modelo exigir autenticação privada
+                // Para mirrors públicos (requiresAuth = false), nunca envia cabeçalhos vazios ou desnecessários
+                if (activeModel.requiresAuth) {
                     val token = getAuthToken()
-                    if (!token.isNullOrBlank()) {
-                        requestBuilder.header("Authorization", "Bearer $token")
+                    if (!token.isNullOrBlank() && token.trim().length > 3) {
+                        requestBuilder.header("Authorization", "Bearer ${token.trim()}")
                     }
 
                     val cookies = getSavedCookies()
-                    if (!cookies.isNullOrBlank()) {
-                        requestBuilder.header("Cookie", cookies)
+                    if (!cookies.isNullOrBlank() && cookies.trim().isNotEmpty()) {
+                        requestBuilder.header("Cookie", cookies.trim())
                     }
                 }
 
@@ -269,13 +271,21 @@ class ModelDownloadManager(
                 val isPartial = responseCode == 206
                 val isFull = responseCode == 200
 
-                // Tratamento de autenticação / termos no Hugging Face
+                // Redundância inteligente: se a URL do Gemma retornar 401 ou 404 para modelo público (sem token),
+                // alterna imediatamente para o mirror verificado sem abrir janelas interativas nem pedir token
+                if ((responseCode == 401 || responseCode == 404) && !activeModel.requiresAuth && activeModel.id == ModelCatalog.LLM_GEMMA_2B.id && activeModel.url != ModelCatalog.GEMMA_VERIFIED_MIRROR_URL) {
+                    Log.w(tag, "HTTP $responseCode no mirror primário. Alternando para o mirror público verificado: ${ModelCatalog.GEMMA_VERIFIED_MIRROR_URL}")
+                    activeModel = activeModel.copy(url = ModelCatalog.GEMMA_VERIFIED_MIRROR_URL)
+                    continue
+                }
+
+                // Tratamento de autenticação / termos no Hugging Face (somente para modelos privados/gated que exigem auth)
                 if (responseCode == 401) {
-                    Log.w(tag, "Modelo ${model.id} retornou HTTP 401 - Requer token ou login")
+                    Log.w(tag, "Modelo ${activeModel.id} retornou HTTP 401 - Requer token ou login")
                     updateState(
-                        model.id,
+                        activeModel.id,
                         ModelDownloadState.RequiresAuth(
-                            modelId = model.id,
+                            modelId = activeModel.id,
                             message = "Erro HTTP 401: Token ou autenticação ausente/inválida. Insira seu token ou use o Mirror Público.",
                             requiresTermsAcceptance = false
                         )

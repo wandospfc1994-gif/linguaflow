@@ -18,6 +18,9 @@ data class ModelInfo(
     val isRequired: Boolean = true,
     val requiresAuth: Boolean = false
 ) {
+    val downloadUrl: String
+        get() = url
+
     val formattedSize: String
         get() {
             val mb = approximateSizeBytes.toDouble() / (1024 * 1024)

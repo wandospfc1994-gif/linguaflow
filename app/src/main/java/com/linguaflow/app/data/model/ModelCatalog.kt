@@ -1,11 +1,11 @@
 package com.linguaflow.app.data.model
 
 object ModelCatalog {
-    const val GEMMA_PUBLIC_MIRROR_URL =
-        "https://huggingface.co/litert-community/gemma-2b-it-cpu-int4/resolve/main/gemma-2b-it-cpu-int4.bin"
+    const val GEMMA_PUBLIC_URL =
+        "https://huggingface.co/litert-community/Gemma2-2B-IT/resolve/main/gemma2-2b-it-gpu-int4.bin"
 
-    const val GEMMA_OFFICIAL_GATED_URL =
-        "https://huggingface.co/google/gemma-2b-it/resolve/main/gemma-2b-it-cpu-int4.bin"
+    const val GEMMA_VERIFIED_MIRROR_URL =
+        "https://huggingface.co/a8nova/gemma-2b-it-cpu-int4/resolve/main/gemma-2b-it-cpu-int4.bin"
 
     val STT_VOSK_EN = ModelInfo(
         id = "stt_vosk_en",
@@ -22,13 +22,13 @@ object ModelCatalog {
 
     val LLM_GEMMA_2B = ModelInfo(
         id = "llm_gemma_2b",
-        name = "Gemma 2B CPU/GPU (Mirror Público Direto)",
+        name = "Gemma 2B CPU/GPU (Modelo Leve Edge AI)",
         type = ModelType.LLM,
         fileName = "gemma-2b-it-cpu-int4.bin",
-        url = GEMMA_PUBLIC_MIRROR_URL,
-        approximateSizeBytes = 1_400_000_000L, // ~1.3 GB
+        url = GEMMA_PUBLIC_URL,
+        approximateSizeBytes = 1_346_559_040L, // ~1.25 GB
         expectedSha256 = "",
-        description = "Inteligência Artificial offline para tutoria, conversação e correções gramaticais. Download 100% público direto sem necessidade de token.",
+        description = "Inteligência Artificial offline para tutoria, conversação natural e correções gramaticais. Download público direto sem token.",
         isRequired = true,
         requiresAuth = false
     )
