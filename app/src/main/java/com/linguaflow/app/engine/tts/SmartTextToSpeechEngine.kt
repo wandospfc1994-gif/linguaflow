@@ -59,6 +59,10 @@ class SmartTextToSpeechEngine(
         nativeEngine.setPitch(pitch)
     }
 
+    override fun setLocale(locale: java.util.Locale) {
+        nativeEngine.setLocale(locale)
+    }
+
     override fun release() {
         piperEngine.release()
         nativeEngine.release()

@@ -119,6 +119,17 @@ class AndroidNativeTtsEngine(
             return
         }
 
+        // Automatic bilingual voice selection: Portuguese for explanations, US English for target language
+        val lower = text.lowercase()
+        val isPortuguese = text.any { it in "ãõáéíóúçêô" } ||
+            listOf("você", "olá", "como", "para", "entendi", "pratique", "inglês", "significa", "explicar", "rotina", "bom dia", "boa tarde").any { lower.contains(it) }
+        val targetLocale = if (isPortuguese) Locale("pt", "BR") else Locale.US
+        try {
+            engine.setLanguage(targetLocale)
+        } catch (e: Exception) {
+            Log.w(tag, "Não foi possível alternar locale para $targetLocale", e)
+        }
+
         // Sentence-by-sentence splitting for natural cadence
         val sentences = text.split(Regex("(?<=[.!?])\\s+")).filter { it.isNotBlank() }
 
@@ -159,6 +170,19 @@ class AndroidNativeTtsEngine(
     override fun setPitch(pitch: Float) {
         currentPitch = pitch.coerceIn(0.5f, 2.0f)
         tts?.setPitch(currentPitch)
+    }
+
+    override fun setLocale(locale: Locale) {
+        try {
+            val result = tts?.setLanguage(locale)
+            if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                Log.w(tag, "Locale $locale não suportado pelo TTS nativo.")
+            } else {
+                Log.d(tag, "TTS nativo configurado para locale $locale")
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "Erro ao mudar locale do TTS", e)
+        }
     }
 
     override fun release() {

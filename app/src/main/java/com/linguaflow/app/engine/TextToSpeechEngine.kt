@@ -15,5 +15,6 @@ interface TextToSpeechEngine {
     fun stop()
     fun setSpeechRate(rate: Float)
     fun setPitch(pitch: Float)
+    fun setLocale(locale: java.util.Locale) {}
     fun release()
 }
