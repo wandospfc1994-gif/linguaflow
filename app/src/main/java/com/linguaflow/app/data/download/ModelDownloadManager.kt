@@ -3,6 +3,7 @@ package com.linguaflow.app.data.download
 import android.content.Context
 import android.net.Uri
 import android.util.Log
+import android.webkit.CookieManager
 import com.linguaflow.app.data.model.ModelCatalog
 import com.linguaflow.app.data.model.ModelDownloadState
 import com.linguaflow.app.data.model.ModelInfo
@@ -28,10 +29,10 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 sealed class HfAuthStatus {
-    data class Success(val username: String, val hasGemmaAccess: Boolean) : HfAuthStatus()
-    data class TermsRequired(val username: String) : HfAuthStatus()
-    data object InvalidToken : HfAuthStatus()
-    data class NetworkError(val message: String) : HfAuthStatus()
+    data class Success(val username: String, val hasGemmaAccess: Boolean, val httpCode: Int = 200) : HfAuthStatus()
+    data class TermsRequired(val username: String, val httpCode: Int = 403) : HfAuthStatus()
+    data class InvalidToken(val httpCode: Int = 401) : HfAuthStatus()
+    data class NetworkError(val message: String, val httpCode: Int? = null) : HfAuthStatus()
 }
 
 class ModelDownloadManager(
@@ -77,6 +78,40 @@ class ModelDownloadManager(
         prefs.edit().remove("hf_token").apply()
     }
 
+    /**
+     * Sincroniza cookies de sessão autenticada da WebView para o OkHttp
+     */
+    fun syncCookiesFromWebView(url: String = "https://huggingface.co") {
+        try {
+            val cookies = CookieManager.getInstance().getCookie(url)
+            if (!cookies.isNullOrBlank()) {
+                prefs.edit().putString("hf_web_cookies", cookies.trim()).apply()
+                Log.d(tag, "Cookies do Hugging Face sincronizados com sucesso.")
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "Erro ao ler cookies do CookieManager: ${e.message}")
+        }
+    }
+
+    fun getSavedCookies(): String? {
+        val cookies = try {
+            CookieManager.getInstance().getCookie("https://huggingface.co")
+        } catch (e: Exception) {
+            null
+        }
+        return if (!cookies.isNullOrBlank()) cookies else prefs.getString("hf_web_cookies", null)
+    }
+
+    fun clearCookies() {
+        prefs.edit().remove("hf_web_cookies").apply()
+        try {
+            CookieManager.getInstance().removeAllCookies(null)
+            CookieManager.getInstance().flush()
+        } catch (e: Exception) {
+            Log.w(tag, "Erro ao limpar cookies: ${e.message}")
+        }
+    }
+
     fun getModelFile(model: ModelInfo): File = File(modelsDir, model.fileName)
 
     private fun getPartFile(model: ModelInfo): File = File(modelsDir, "${model.fileName}.part")
@@ -113,7 +148,7 @@ class ModelDownloadManager(
 
     /**
      * Inicia download automático em segundo plano dos modelos obrigatórios que ainda não estejam instalados.
-     * Previne loop infinito ignorando modelos com erro ativo ou que requerem autenticação/termos.
+     * Previne loops ignorando estados ativos ou de erro/autenticação.
      */
     fun startAutoDownloadMissingRequiredModels() {
         val required = ModelCatalog.allModels.filter { it.isRequired }
@@ -125,7 +160,7 @@ class ModelDownloadManager(
                 currentState is ModelDownloadState.RequiresAuth ||
                 currentState is ModelDownloadState.Error
             if ((!file.exists() || file.length() == 0L) && !isBusyOrBlocked) {
-                Log.d(tag, "Iniciando download automático para o modelo obrigatório: ${model.name}")
+                Log.d(tag, "Iniciando download automático para o modelo: ${model.name}")
                 startDownload(model)
             }
         }
@@ -214,10 +249,17 @@ class ModelDownloadManager(
                     requestBuilder.header("Range", "bytes=$existingBytes-")
                 }
 
-                // Injeta header se o modelo for do Hugging Face e houver token salvo
-                val token = getAuthToken()
-                if (!token.isNullOrBlank() && model.url.contains("huggingface.co")) {
-                    requestBuilder.header("Authorization", "Bearer $token")
+                // Injeta Cookies e Bearer Token para URLs da Hugging Face
+                if (model.url.contains("huggingface.co")) {
+                    val token = getAuthToken()
+                    if (!token.isNullOrBlank()) {
+                        requestBuilder.header("Authorization", "Bearer $token")
+                    }
+
+                    val cookies = getSavedCookies()
+                    if (!cookies.isNullOrBlank()) {
+                        requestBuilder.header("Cookie", cookies)
+                    }
                 }
 
                 val request = requestBuilder.build()
@@ -227,14 +269,14 @@ class ModelDownloadManager(
                 val isPartial = responseCode == 206
                 val isFull = responseCode == 200
 
-                // Tratamento de autenticação exigida (HTTP 401 ou 403 no Hugging Face)
+                // Tratamento de autenticação / termos no Hugging Face
                 if (responseCode == 401) {
-                    Log.w(tag, "Modelo ${model.id} retornou HTTP 401 - Requer token de acesso")
+                    Log.w(tag, "Modelo ${model.id} retornou HTTP 401 - Requer token ou login")
                     updateState(
                         model.id,
                         ModelDownloadState.RequiresAuth(
                             modelId = model.id,
-                            message = "Token do Hugging Face ausente ou inválido. Insira seu token de acesso.",
+                            message = "Erro HTTP 401: Token ou autenticação ausente/inválida. Insira seu token ou use o Mirror Público.",
                             requiresTermsAcceptance = false
                         )
                     )
@@ -247,7 +289,7 @@ class ModelDownloadManager(
                         model.id,
                         ModelDownloadState.RequiresAuth(
                             modelId = model.id,
-                            message = "Acesso restrito (HTTP 403): Você precisa aceitar os termos de licença do Gemma 2B no Hugging Face com sua conta.",
+                            message = "Erro HTTP 403: Licença do Gemma 2B não aceita na conta Hugging Face. Aceite os termos na aba Web ou use o Mirror Público.",
                             requiresTermsAcceptance = true
                         )
                     )
@@ -259,7 +301,7 @@ class ModelDownloadManager(
                         isCompleted = true
                         break
                     } else {
-                        Log.w(tag, "HTTP 416 para ${model.id}: faixa de bytes inválida, reiniciando partFile.")
+                        Log.w(tag, "HTTP 416 para ${model.id}: faixa inválida, reiniciando partFile.")
                         partFile.delete()
                         continue
                     }
@@ -372,11 +414,12 @@ class ModelDownloadManager(
     }
 
     /**
-     * Valida o token e permissões de acesso ao repositório Gemma 2B via API do Hugging Face.
+     * Valida o token e permissões de acesso ao repositório Gemma 2B via API do Hugging Face,
+     * retornando códigos HTTP exatos para diagnóstico transparente.
      */
     suspend fun verifyHfAccess(token: String): HfAuthStatus = withContext(Dispatchers.IO) {
         val trimmed = token.trim()
-        if (trimmed.isEmpty()) return@withContext HfAuthStatus.InvalidToken
+        if (trimmed.isEmpty()) return@withContext HfAuthStatus.InvalidToken(401)
 
         try {
             val whoamiReq = Request.Builder()
@@ -386,11 +429,13 @@ class ModelDownloadManager(
                 .build()
 
             val whoamiResp = okHttpClient.newCall(whoamiReq).execute()
-            if (whoamiResp.code == 401) {
-                return@withContext HfAuthStatus.InvalidToken
+            val whoamiCode = whoamiResp.code
+
+            if (whoamiCode == 401) {
+                return@withContext HfAuthStatus.InvalidToken(401)
             }
             if (!whoamiResp.isSuccessful) {
-                return@withContext HfAuthStatus.NetworkError("HTTP ${whoamiResp.code}")
+                return@withContext HfAuthStatus.NetworkError("Erro HTTP $whoamiCode na verificação da conta", whoamiCode)
             }
 
             val whoamiBody = whoamiResp.body?.string() ?: ""
@@ -400,7 +445,7 @@ class ModelDownloadManager(
                 "Usuário"
             }
 
-            // Testa acesso ao repositório fechado/gated do Gemma 2B
+            // Testa acesso ao repositório do Gemma 2B
             val gemmaReq = Request.Builder()
                 .url("https://huggingface.co/api/models/google/gemma-2b-it")
                 .header("Authorization", "Bearer $trimmed")
@@ -408,13 +453,16 @@ class ModelDownloadManager(
                 .build()
 
             val gemmaResp = okHttpClient.newCall(gemmaReq).execute()
-            when (gemmaResp.code) {
-                200 -> HfAuthStatus.Success(username = username, hasGemmaAccess = true)
-                403 -> HfAuthStatus.TermsRequired(username = username)
-                else -> HfAuthStatus.Success(username = username, hasGemmaAccess = false)
+            val gemmaCode = gemmaResp.code
+
+            when (gemmaCode) {
+                200 -> HfAuthStatus.Success(username = username, hasGemmaAccess = true, httpCode = 200)
+                403 -> HfAuthStatus.TermsRequired(username = username, httpCode = 403)
+                401 -> HfAuthStatus.InvalidToken(401)
+                else -> HfAuthStatus.Success(username = username, hasGemmaAccess = false, httpCode = gemmaCode)
             }
         } catch (e: Exception) {
-            HfAuthStatus.NetworkError(e.localizedMessage ?: "Erro de rede")
+            HfAuthStatus.NetworkError(e.localizedMessage ?: "Erro de conexão com o servidor")
         }
     }
 

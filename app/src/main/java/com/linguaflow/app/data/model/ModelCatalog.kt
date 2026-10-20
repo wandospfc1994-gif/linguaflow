@@ -1,6 +1,12 @@
 package com.linguaflow.app.data.model
 
 object ModelCatalog {
+    const val GEMMA_PUBLIC_MIRROR_URL =
+        "https://huggingface.co/litert-community/gemma-2b-it-cpu-int4/resolve/main/gemma-2b-it-cpu-int4.bin"
+
+    const val GEMMA_OFFICIAL_GATED_URL =
+        "https://huggingface.co/google/gemma-2b-it/resolve/main/gemma-2b-it-cpu-int4.bin"
+
     val STT_VOSK_EN = ModelInfo(
         id = "stt_vosk_en",
         name = "Vosk STT Inglês (Fase A)",
@@ -16,15 +22,15 @@ object ModelCatalog {
 
     val LLM_GEMMA_2B = ModelInfo(
         id = "llm_gemma_2b",
-        name = "Gemma 2B CPU/GPU (Modelo Leve Edge AI)",
+        name = "Gemma 2B CPU/GPU (Mirror Público Direto)",
         type = ModelType.LLM,
         fileName = "gemma-2b-it-cpu-int4.bin",
-        url = "https://huggingface.co/google/gemma-2b-it/resolve/main/gemma-2b-it-cpu-int4.bin",
+        url = GEMMA_PUBLIC_MIRROR_URL,
         approximateSizeBytes = 1_400_000_000L, // ~1.3 GB
-        expectedSha256 = "a5e9f1c7d23e809b44fc876210ef395b214a1c5d9a9103de33b6680410ff0291",
-        description = "Inteligência Artificial offline para tutoria, conversação natural e correções gramaticais com MediaPipe.",
+        expectedSha256 = "",
+        description = "Inteligência Artificial offline para tutoria, conversação e correções gramaticais. Download 100% público direto sem necessidade de token.",
         isRequired = true,
-        requiresAuth = true
+        requiresAuth = false
     )
 
     val STT_WHISPER_EN = ModelInfo(
@@ -56,4 +62,12 @@ object ModelCatalog {
     val allModels: List<ModelInfo> = listOf(STT_VOSK_EN, LLM_GEMMA_2B, STT_WHISPER_EN, TTS_PIPER_EN)
 
     fun getModelById(id: String): ModelInfo? = allModels.find { it.id == id }
+
+    fun createGemmaModelWithUrl(url: String, requiresAuth: Boolean): ModelInfo {
+        return LLM_GEMMA_2B.copy(
+            url = url,
+            requiresAuth = requiresAuth,
+            name = if (requiresAuth) "Gemma 2B (Repositório Oficial HF)" else "Gemma 2B (Mirror Público Direto)"
+        )
+    }
 }

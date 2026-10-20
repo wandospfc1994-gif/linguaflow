@@ -1,9 +1,9 @@
 package com.linguaflow.app.ui.screens
 
-import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.net.Uri
+import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -11,7 +11,6 @@ import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -37,13 +36,14 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Key
-import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.OpenInBrowser
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -137,6 +137,7 @@ fun OnboardingScreen(
     }
 
     // DISPARO AUTOMÁTICO DE DOWNLOAD: Inicia uma única vez em background se não houver modelos prontos
+    // Com o ModelCatalog público, o download agora inicia 100% livre e sem travas de token!
     LaunchedEffect(Unit) {
         if (!modelManager.hasMinimumRequiredModels()) {
             modelManager.startAutoDownloadMissingRequiredModels()
@@ -356,7 +357,7 @@ fun OnboardingScreen(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Download resiliente com retomada automática",
+                        text = "Download público direto (sem necessidade de token)",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -371,7 +372,7 @@ fun OnboardingScreen(
                 ) {
                     Icon(imageVector = Icons.Default.Key, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(4.dp))
-                    Text("Token HF", style = MaterialTheme.typography.labelSmall)
+                    Text("Opções HF", style = MaterialTheme.typography.labelSmall)
                 }
             }
 
@@ -459,6 +460,17 @@ fun OnboardingScreen(
                     modelManager.startDownload(m)
                 }
                 showAuthDialog = false
+            },
+            onUsePublicMirror = {
+                // Alterna imediatamente para o mirror público direto sem exigência de token
+                val publicModel = ModelCatalog.LLM_GEMMA_2B
+                authDialogModel?.let { m ->
+                    dismissedAuthModelIds = dismissedAuthModelIds + m.id
+                    modelManager.clearError(publicModel)
+                    modelManager.startDownload(publicModel)
+                }
+                showAuthDialog = false
+                Toast.makeText(context, "Iniciando download via Mirror Público sem token!", Toast.LENGTH_SHORT).show()
             }
         )
     }
@@ -470,7 +482,8 @@ fun HuggingFaceAuthDialog(
     initialToken: String,
     modelManager: ModelDownloadManager,
     onDismiss: () -> Unit,
-    onTokenSaved: (String) -> Unit
+    onTokenSaved: (String) -> Unit,
+    onUsePublicMirror: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -482,7 +495,8 @@ fun HuggingFaceAuthDialog(
     var isVerifying by remember { mutableStateOf(false) }
     var authVerificationStatus by remember { mutableStateOf<HfAuthStatus?>(null) }
 
-    var webViewUrl by remember { mutableStateOf("https://huggingface.co/google/gemma-2b-it") }
+    val initialWebUrl = "https://huggingface.co/google/gemma-2b-it"
+    var webViewUrl by remember { mutableStateOf(initialWebUrl) }
     var isWebLoading by remember { mutableStateOf(false) }
     var webViewInstance by remember { mutableStateOf<WebView?>(null) }
 
@@ -506,7 +520,7 @@ fun HuggingFaceAuthDialog(
                     )
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = "Acesso Hugging Face",
+                        text = "Configuração do Hugging Face",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
@@ -522,6 +536,50 @@ fun HuggingFaceAuthDialog(
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState())
             ) {
+                // Banner para uso direto do mirror público (1 clique)
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Public,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                text = "Recomendado: Mirror Público Direto",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = "Dispensa token de acesso, aceite prévio de termos e login no Hugging Face.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Button(
+                            onClick = onUsePublicMirror,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("btn_use_public_mirror"),
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                        ) {
+                            Icon(imageVector = Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Baixar Mirror Público Agora (Sem Token)")
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(14.dp))
+
                 // Abas de navegação
                 TabRow(selectedTabIndex = selectedTab) {
                     Tab(
@@ -543,7 +601,7 @@ fun HuggingFaceAuthDialog(
                 if (selectedTab == 0) {
                     // Aba 0: Inserção e validação do token
                     Text(
-                        text = "O modelo ${targetModel.name} requer autorização da Hugging Face para download dos pesos quantizados.",
+                        text = "Caso deseje utilizar sua própria conta no repositório oficial do Hugging Face, insira seu User Access Token (Read):",
                         style = MaterialTheme.typography.bodyMedium
                     )
 
@@ -556,7 +614,7 @@ fun HuggingFaceAuthDialog(
                             authVerificationStatus = null
                         },
                         label = { Text("User Access Token (hf_...)") },
-                        placeholder = { Text("Cole aqui seu token de leitura") },
+                        placeholder = { Text("Cole seu token de leitura") },
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                         visualTransformation = if (isTokenPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
@@ -587,7 +645,7 @@ fun HuggingFaceAuthDialog(
 
                     Spacer(Modifier.height(8.dp))
 
-                    // Botão de testar conexão
+                    // Botão de testar conexão com diagnóstico transparente
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -601,6 +659,38 @@ fun HuggingFaceAuthDialog(
                                         val status = modelManager.verifyHfAccess(tokenText)
                                         authVerificationStatus = status
                                         isVerifying = false
+
+                                        // Toast explícito com código HTTP transparente
+                                        when (status) {
+                                            is HfAuthStatus.Success -> {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Sucesso HTTP ${status.httpCode}: Autenticado como @${status.username}!",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            }
+                                            is HfAuthStatus.TermsRequired -> {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Erro HTTP ${status.httpCode}: Termos de licença não aceitos na conta @${status.username}.",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            }
+                                            is HfAuthStatus.InvalidToken -> {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Erro HTTP ${status.httpCode}: Token inválido ou não autorizado.",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            }
+                                            is HfAuthStatus.NetworkError -> {
+                                                Toast.makeText(
+                                                    context,
+                                                    status.message,
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            }
+                                        }
                                     }
                                 } else {
                                     Toast.makeText(context, "Insira um token antes de verificar.", Toast.LENGTH_SHORT).show()
@@ -648,7 +738,7 @@ fun HuggingFaceAuthDialog(
                                         Spacer(Modifier.width(8.dp))
                                         Column {
                                             Text(
-                                                text = "Conectado como @${status.username}",
+                                                text = "HTTP ${status.httpCode} • Conectado como @${status.username}",
                                                 fontWeight = FontWeight.Bold,
                                                 style = MaterialTheme.typography.labelMedium
                                             )
@@ -676,7 +766,7 @@ fun HuggingFaceAuthDialog(
                                             )
                                             Spacer(Modifier.width(8.dp))
                                             Text(
-                                                text = "Termos de Licença Pendentes",
+                                                text = "Erro HTTP ${status.httpCode}: Licença Pendente",
                                                 fontWeight = FontWeight.Bold,
                                                 color = MaterialTheme.colorScheme.error,
                                                 style = MaterialTheme.typography.labelMedium
@@ -688,14 +778,23 @@ fun HuggingFaceAuthDialog(
                                             style = MaterialTheme.typography.bodySmall
                                         )
                                         Spacer(Modifier.height(6.dp))
-                                        Button(
-                                            onClick = {
-                                                webViewUrl = "https://huggingface.co/google/gemma-2b-it"
-                                                selectedTab = 1
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                                        ) {
-                                            Text("Aceitar Termos na Web Agora", fontSize = 12.sp)
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            Button(
+                                                onClick = {
+                                                    webViewUrl = "https://huggingface.co/google/gemma-2b-it"
+                                                    selectedTab = 1
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                                modifier = Modifier.weight(1f)
+                                            ) {
+                                                Text("Aceitar na Web", fontSize = 11.sp, maxLines = 1)
+                                            }
+                                            OutlinedButton(
+                                                onClick = onUsePublicMirror,
+                                                modifier = Modifier.weight(1f)
+                                            ) {
+                                                Text("Usar Mirror Livre", fontSize = 11.sp, maxLines = 1)
+                                            }
                                         }
                                     }
                                 }
@@ -716,17 +815,25 @@ fun HuggingFaceAuthDialog(
                                             tint = MaterialTheme.colorScheme.error
                                         )
                                         Spacer(Modifier.width(8.dp))
-                                        Text(
-                                            text = "Token inválido ou não reconhecido pela API do Hugging Face.",
-                                            color = MaterialTheme.colorScheme.error,
-                                            style = MaterialTheme.typography.bodySmall
-                                        )
+                                        Column {
+                                            Text(
+                                                text = "Erro HTTP ${status.httpCode}: Token Inválido",
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.error,
+                                                style = MaterialTheme.typography.labelMedium
+                                            )
+                                            Text(
+                                                text = "O token fornecido não foi reconhecido pela API do Hugging Face.",
+                                                color = MaterialTheme.colorScheme.error,
+                                                style = MaterialTheme.typography.bodySmall
+                                            )
+                                        }
                                     }
                                 }
                             }
                             is HfAuthStatus.NetworkError -> {
                                 Text(
-                                    text = "Falha ao validar com a Hugging Face: ${status.message}",
+                                    text = status.message,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.error
                                 )
@@ -734,7 +841,7 @@ fun HuggingFaceAuthDialog(
                         }
                     }
                 } else {
-                    // Aba 1: WebView Embutida
+                    // Aba 1: WebView Embutida com sincronização de cookies
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -757,6 +864,12 @@ fun HuggingFaceAuthDialog(
                                 modifier = Modifier.weight(1f)
                             ) {
                                 Text("Meus Tokens", fontSize = 11.sp, maxLines = 1)
+                            }
+                            IconButton(onClick = {
+                                modelManager.syncCookiesFromWebView()
+                                Toast.makeText(context, "Cookies sincronizados!", Toast.LENGTH_SHORT).show()
+                            }) {
+                                Icon(imageVector = Icons.Default.Sync, contentDescription = "Sincronizar Cookies")
                             }
                             IconButton(onClick = { webViewInstance?.reload() }) {
                                 Icon(imageVector = Icons.Default.Refresh, contentDescription = "Recarregar")
@@ -788,9 +901,14 @@ fun HuggingFaceAuthDialog(
                                         settings.loadWithOverviewMode = true
                                         settings.useWideViewPort = true
                                         settings.setSupportZoom(true)
+
+                                        CookieManager.getInstance().setAcceptCookie(true)
+                                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
                                         webViewClient = object : WebViewClient() {
                                             override fun onPageFinished(view: WebView?, url: String?) {
                                                 isWebLoading = false
+                                                modelManager.syncCookiesFromWebView(url ?: "https://huggingface.co")
                                             }
                                         }
                                         webChromeClient = object : WebChromeClient() {
@@ -811,7 +929,7 @@ fun HuggingFaceAuthDialog(
 
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            text = "Faça login com sua conta, clique em 'Acknowledge license' e depois copie seu token em 'Meus Tokens'.",
+                            text = "Faça login com sua conta, aceite a licença do Gemma 2B e depois toque em 'Sincronizar' ou gere seu token.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -825,7 +943,7 @@ fun HuggingFaceAuthDialog(
                     if (tokenText.isNotBlank()) {
                         onTokenSaved(tokenText.trim())
                     } else {
-                        Toast.makeText(context, "Por favor, insira o token.", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Por favor, insira o token ou use o Mirror Público.", Toast.LENGTH_SHORT).show()
                     }
                 },
                 modifier = Modifier.testTag("btn_confirm_token")
