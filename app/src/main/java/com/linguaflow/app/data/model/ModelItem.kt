@@ -43,7 +43,8 @@ sealed class ModelDownloadState {
     ) : ModelDownloadState()
     data class RequiresAuth(
         val modelId: String,
-        val message: String = "Autenticação ou Token do Hugging Face necessário para baixar este modelo"
+        val message: String = "Autenticação ou Token do Hugging Face necessário para baixar este modelo",
+        val requiresTermsAcceptance: Boolean = false
     ) : ModelDownloadState()
     data class Verifying(val message: String = "Verificando integridade SHA-256...") : ModelDownloadState()
     data class Installed(val fileSizeBytes: Long) : ModelDownloadState()

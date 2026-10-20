@@ -1,7 +1,14 @@
 package com.linguaflow.app.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.net.Uri
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -25,27 +32,25 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDownload
-import androidx.compose.material.icons.filled.FileOpen
+import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Language
-import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.OpenInBrowser
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
-import androidx.compose.material.icons.filled.Speed
-import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -53,11 +58,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -73,7 +81,10 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.linguaflow.app.data.download.HfAuthStatus
 import com.linguaflow.app.data.download.ModelDownloadManager
 import com.linguaflow.app.data.model.ModelCatalog
 import com.linguaflow.app.data.model.ModelDownloadState
@@ -104,11 +115,11 @@ fun OnboardingScreen(
     var selectedLevel by remember { mutableStateOf("A1") }
     var selectedGoal by remember { mutableStateOf("10 min / dia") }
 
-    // Dialog de Autenticação / Token do Hugging Face nativo
+    // Dialog de Autenticação / Termos Hugging Face (com WebView e Verificação de Token)
     var showAuthDialog by remember { mutableStateOf(false) }
     var tokenInput by remember { mutableStateOf(modelManager.getAuthToken() ?: "") }
     var authDialogModel by remember { mutableStateOf<ModelInfo?>(null) }
-    var isTokenPasswordVisible by remember { mutableStateOf(false) }
+    var dismissedAuthModelIds by remember { mutableStateOf(setOf<String>()) }
 
     // Rastreia modelo recebendo arquivo importado manualmente
     var targetModelForImport by remember { mutableStateOf<ModelInfo?>(null) }
@@ -125,16 +136,18 @@ fun OnboardingScreen(
         }
     }
 
-    // DISPARO AUTOMÁTICO DE DOWNLOAD: Na primeira abertura, se não tiver os modelos mínimos, inicia sozinho!
+    // DISPARO AUTOMÁTICO DE DOWNLOAD: Inicia uma única vez em background se não houver modelos prontos
     LaunchedEffect(Unit) {
         if (!modelManager.hasMinimumRequiredModels()) {
             modelManager.startAutoDownloadMissingRequiredModels()
         }
     }
 
-    // Monitora se algum modelo solicitou autenticação para exibir o dialog nativo automaticamente
+    // Monitora se algum modelo solicitou autenticação para exibir o dialog (com proteção contra loop infinito)
     LaunchedEffect(downloadStates) {
-        val requiresAuthEntry = downloadStates.entries.firstOrNull { it.value is ModelDownloadState.RequiresAuth }
+        val requiresAuthEntry = downloadStates.entries.firstOrNull {
+            it.value is ModelDownloadState.RequiresAuth && !dismissedAuthModelIds.contains(it.key)
+        }
         if (requiresAuthEntry != null && !showAuthDialog) {
             authDialogModel = ModelCatalog.getModelById(requiresAuthEntry.key)
             showAuthDialog = true
@@ -145,7 +158,7 @@ fun OnboardingScreen(
         .filter { it.isRequired }
         .all { downloadStates[it.id] is ModelDownloadState.Installed }
 
-    androidx.activity.compose.BackHandler {
+    BackHandler {
         onFinish()
     }
 
@@ -343,14 +356,17 @@ fun OnboardingScreen(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Download automático via HTTP em segundo plano",
+                        text = "Download resiliente com retomada automática",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
 
                 TextButton(
-                    onClick = { showAuthDialog = true },
+                    onClick = {
+                        authDialogModel = ModelCatalog.LLM_GEMMA_2B
+                        showAuthDialog = true
+                    },
                     modifier = Modifier.testTag("btn_configure_hf_token")
                 ) {
                     Icon(imageVector = Icons.Default.Key, contentDescription = null, modifier = Modifier.size(16.dp))
@@ -366,12 +382,16 @@ fun OnboardingScreen(
                 ModelDownloadItemCard(
                     model = model,
                     state = state,
-                    onStartDownload = { modelManager.startDownload(model) },
+                    onStartDownload = {
+                        modelManager.clearError(model)
+                        modelManager.startDownload(model)
+                    },
                     onPauseDownload = { modelManager.pauseDownload(model) },
                     onResumeDownload = { modelManager.resumeDownload(model) },
                     onCancelDownload = { modelManager.cancelDownload(model) },
                     onAuthenticate = {
                         authDialogModel = model
+                        dismissedAuthModelIds = dismissedAuthModelIds - model.id
                         showAuthDialog = true
                     },
                     onSelectManualFile = {
@@ -418,11 +438,66 @@ fun OnboardingScreen(
         }
     }
 
-    // Modal Nativo de Autenticação / Token Hugging Face
+    // Modal Nativo de Autenticação / Termos Hugging Face com WebView Embutida
     if (showAuthDialog) {
-        AlertDialog(
-            onDismissRequest = { showAuthDialog = false },
-            title = {
+        HuggingFaceAuthDialog(
+            targetModel = authDialogModel ?: ModelCatalog.LLM_GEMMA_2B,
+            initialToken = tokenInput,
+            modelManager = modelManager,
+            onDismiss = {
+                authDialogModel?.let { m ->
+                    dismissedAuthModelIds = dismissedAuthModelIds + m.id
+                }
+                showAuthDialog = false
+            },
+            onTokenSaved = { savedToken ->
+                tokenInput = savedToken
+                modelManager.saveAuthToken(savedToken)
+                authDialogModel?.let { m ->
+                    dismissedAuthModelIds = dismissedAuthModelIds - m.id
+                    modelManager.clearError(m)
+                    modelManager.startDownload(m)
+                }
+                showAuthDialog = false
+            }
+        )
+    }
+}
+
+@Composable
+fun HuggingFaceAuthDialog(
+    targetModel: ModelInfo,
+    initialToken: String,
+    modelManager: ModelDownloadManager,
+    onDismiss: () -> Unit,
+    onTokenSaved: (String) -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var selectedTab by remember { mutableIntStateOf(0) } // 0: Chave / Token, 1: WebView
+    var tokenText by remember { mutableStateOf(initialToken) }
+    var isTokenPasswordVisible by remember { mutableStateOf(false) }
+
+    var isVerifying by remember { mutableStateOf(false) }
+    var authVerificationStatus by remember { mutableStateOf<HfAuthStatus?>(null) }
+
+    var webViewUrl by remember { mutableStateOf("https://huggingface.co/google/gemma-2b-it") }
+    var isWebLoading by remember { mutableStateOf(false) }
+    var webViewInstance by remember { mutableStateOf<WebView?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        modifier = Modifier
+            .fillMaxWidth(0.95f)
+            .padding(vertical = 16.dp),
+        title = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         imageVector = Icons.Default.Security,
@@ -431,74 +506,339 @@ fun OnboardingScreen(
                     )
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = "Autenticação Hugging Face",
-                        style = MaterialTheme.typography.titleLarge
+                        text = "Acesso Hugging Face",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
                     )
                 }
-            },
-            text = {
-                Column {
+                IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
+                    Icon(imageVector = Icons.Default.Close, contentDescription = "Fechar")
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                // Abas de navegação
+                TabRow(selectedTabIndex = selectedTab) {
+                    Tab(
+                        selected = selectedTab == 0,
+                        onClick = { selectedTab = 0 },
+                        text = { Text("Token & Chave") },
+                        icon = { Icon(imageVector = Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp)) }
+                    )
+                    Tab(
+                        selected = selectedTab == 1,
+                        onClick = { selectedTab = 1 },
+                        text = { Text("Web / Termos") },
+                        icon = { Icon(imageVector = Icons.Default.OpenInBrowser, contentDescription = null, modifier = Modifier.size(18.dp)) }
+                    )
+                }
+
+                Spacer(Modifier.height(14.dp))
+
+                if (selectedTab == 0) {
+                    // Aba 0: Inserção e validação do token
                     Text(
-                        text = "Para baixar os pesos otimizados do modelo ${authDialogModel?.name ?: "Gemma"}, insira seu User Access Token (Read) do Hugging Face.",
+                        text = "O modelo ${targetModel.name} requer autorização da Hugging Face para download dos pesos quantizados.",
                         style = MaterialTheme.typography.bodyMedium
                     )
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        text = "O download é 100% gratuito e direto para a pasta interna do app.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(Modifier.height(14.dp))
+
+                    Spacer(Modifier.height(12.dp))
 
                     OutlinedTextField(
-                        value = tokenInput,
-                        onValueChange = { tokenInput = it },
-                        label = { Text("Token de Acesso (hf_...)") },
-                        placeholder = { Text("Cole aqui seu token") },
+                        value = tokenText,
+                        onValueChange = {
+                            tokenText = it
+                            authVerificationStatus = null
+                        },
+                        label = { Text("User Access Token (hf_...)") },
+                        placeholder = { Text("Cole aqui seu token de leitura") },
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                         visualTransformation = if (isTokenPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
                         trailingIcon = {
-                            IconButton(onClick = { isTokenPasswordVisible = !isTokenPasswordVisible }) {
-                                Icon(
-                                    imageVector = if (isTokenPasswordVisible) Icons.Default.Close else Icons.Default.Key,
-                                    contentDescription = "Alternar visibilidade"
-                                )
+                            Row {
+                                IconButton(onClick = {
+                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                    val clip = clipboard?.primaryClip?.getItemAt(0)?.text?.toString()
+                                    if (!clip.isNullOrBlank()) {
+                                        tokenText = clip.trim()
+                                        Toast.makeText(context, "Token colado!", Toast.LENGTH_SHORT).show()
+                                    }
+                                }) {
+                                    Icon(imageVector = Icons.Default.ContentPaste, contentDescription = "Colar")
+                                }
+                                IconButton(onClick = { isTokenPasswordVisible = !isTokenPasswordVisible }) {
+                                    Icon(
+                                        imageVector = if (isTokenPasswordVisible) Icons.Default.Close else Icons.Default.Key,
+                                        contentDescription = "Alternar visibilidade"
+                                    )
+                                }
                             }
                         },
                         modifier = Modifier
                             .fillMaxWidth()
                             .testTag("input_hf_token")
                     )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        if (tokenInput.isNotBlank()) {
-                            modelManager.saveAuthToken(tokenInput)
-                            showAuthDialog = false
-                            val target = authDialogModel ?: ModelCatalog.LLM_GEMMA_2B
-                            modelManager.startDownload(target)
-                            Toast.makeText(context, "Token salvo! Iniciando download...", Toast.LENGTH_SHORT).show()
-                        } else {
-                            Toast.makeText(context, "Por favor, insira o token.", Toast.LENGTH_SHORT).show()
+
+                    Spacer(Modifier.height(8.dp))
+
+                    // Botão de testar conexão
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                if (tokenText.isNotBlank()) {
+                                    scope.launch {
+                                        isVerifying = true
+                                        val status = modelManager.verifyHfAccess(tokenText)
+                                        authVerificationStatus = status
+                                        isVerifying = false
+                                    }
+                                } else {
+                                    Toast.makeText(context, "Insira um token antes de verificar.", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            enabled = !isVerifying && tokenText.isNotBlank(),
+                            modifier = Modifier.testTag("btn_verify_hf_token")
+                        ) {
+                            if (isVerifying) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.width(6.dp))
+                                Text("Verificando...")
+                            } else {
+                                Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Testar Acesso")
+                            }
                         }
-                    },
-                    modifier = Modifier.testTag("btn_confirm_token")
-                ) {
-                    Text("Salvar e Baixar")
-                }
-            },
-            dismissButton = {
-                OutlinedButton(
-                    onClick = { showAuthDialog = false }
-                ) {
-                    Text("Cancelar")
+
+                        TextButton(onClick = { selectedTab = 1 }) {
+                            Text("Abrir Termos Web", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+
+                    // Exibição do feedback de status de verificação
+                    authVerificationStatus?.let { status ->
+                        Spacer(Modifier.height(10.dp))
+                        when (status) {
+                            is HfAuthStatus.Success -> {
+                                Surface(
+                                    color = if (status.hasGemmaAccess) MaterialTheme.colorScheme.primaryContainer
+                                    else MaterialTheme.colorScheme.tertiaryContainer,
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.CheckCircle,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        Column {
+                                            Text(
+                                                text = "Conectado como @${status.username}",
+                                                fontWeight = FontWeight.Bold,
+                                                style = MaterialTheme.typography.labelMedium
+                                            )
+                                            Text(
+                                                text = if (status.hasGemmaAccess) "Acesso ao modelo Gemma liberado e verificado!"
+                                                else "Token válido! Se necessário, certifique-se de aceitar os termos na página do modelo.",
+                                                style = MaterialTheme.typography.bodySmall
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            is HfAuthStatus.TermsRequired -> {
+                                Surface(
+                                    color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.8f),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(modifier = Modifier.padding(10.dp)) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Icon(
+                                                imageVector = Icons.Default.Warning,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.error
+                                            )
+                                            Spacer(Modifier.width(8.dp))
+                                            Text(
+                                                text = "Termos de Licença Pendentes",
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.error,
+                                                style = MaterialTheme.typography.labelMedium
+                                            )
+                                        }
+                                        Spacer(Modifier.height(4.dp))
+                                        Text(
+                                            text = "Seu token para @${status.username} é válido, mas os termos de licença do Gemma 2B ainda não foram aceitos na Hugging Face.",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                        Spacer(Modifier.height(6.dp))
+                                        Button(
+                                            onClick = {
+                                                webViewUrl = "https://huggingface.co/google/gemma-2b-it"
+                                                selectedTab = 1
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                                        ) {
+                                            Text("Aceitar Termos na Web Agora", fontSize = 12.sp)
+                                        }
+                                    }
+                                }
+                            }
+                            is HfAuthStatus.InvalidToken -> {
+                                Surface(
+                                    color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.8f),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Close,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.error
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(
+                                            text = "Token inválido ou não reconhecido pela API do Hugging Face.",
+                                            color = MaterialTheme.colorScheme.error,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+                                }
+                            }
+                            is HfAuthStatus.NetworkError -> {
+                                Text(
+                                    text = "Falha ao validar com a Hugging Face: ${status.message}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    // Aba 1: WebView Embutida
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    webViewUrl = "https://huggingface.co/google/gemma-2b-it"
+                                    webViewInstance?.loadUrl(webViewUrl)
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("Gemma 2B", fontSize = 11.sp, maxLines = 1)
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    webViewUrl = "https://huggingface.co/settings/tokens"
+                                    webViewInstance?.loadUrl(webViewUrl)
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("Meus Tokens", fontSize = 11.sp, maxLines = 1)
+                            }
+                            IconButton(onClick = { webViewInstance?.reload() }) {
+                                Icon(imageVector = Icons.Default.Refresh, contentDescription = "Recarregar")
+                            }
+                        }
+
+                        if (isWebLoading) {
+                            LinearProgressIndicator(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp)
+                            )
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(320.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                        ) {
+                            AndroidView(
+                                factory = { ctx ->
+                                    WebView(ctx).apply {
+                                        settings.javaScriptEnabled = true
+                                        settings.domStorageEnabled = true
+                                        settings.loadWithOverviewMode = true
+                                        settings.useWideViewPort = true
+                                        settings.setSupportZoom(true)
+                                        webViewClient = object : WebViewClient() {
+                                            override fun onPageFinished(view: WebView?, url: String?) {
+                                                isWebLoading = false
+                                            }
+                                        }
+                                        webChromeClient = object : WebChromeClient() {
+                                            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                                                isWebLoading = newProgress < 100
+                                            }
+                                        }
+                                        loadUrl(webViewUrl)
+                                        webViewInstance = this
+                                    }
+                                },
+                                update = { view ->
+                                    webViewInstance = view
+                                },
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = "Faça login com sua conta, clique em 'Acknowledge license' e depois copie seu token em 'Meus Tokens'.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
-        )
-    }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (tokenText.isNotBlank()) {
+                        onTokenSaved(tokenText.trim())
+                    } else {
+                        Toast.makeText(context, "Por favor, insira o token.", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                modifier = Modifier.testTag("btn_confirm_token")
+            ) {
+                Text("Salvar e Baixar")
+            }
+        },
+        dismissButton = {
+            OutlinedButton(onClick = onDismiss) {
+                Text("Fechar")
+            }
+        }
+    )
 }
 
 @Composable
@@ -521,6 +861,7 @@ fun ModelDownloadItemCard(
                 is ModelDownloadState.Installed -> MaterialTheme.colorScheme.surfaceVariant
                 is ModelDownloadState.Downloading -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
                 is ModelDownloadState.RequiresAuth -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f)
+                is ModelDownloadState.Error -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.25f)
                 else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
             }
         ),
@@ -604,9 +945,10 @@ fun ModelDownloadItemCard(
                         Button(
                             onClick = onAuthenticate,
                             shape = RoundedCornerShape(8.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                            modifier = Modifier.testTag("btn_auth_${model.id}")
                         ) {
-                            Text("Autenticar", fontSize = 12.sp)
+                            Text(if (state.requiresTermsAcceptance) "Termos" else "Autenticar", fontSize = 12.sp)
                         }
                     }
                     is ModelDownloadState.Verifying -> {
@@ -617,8 +959,17 @@ fun ModelDownloadItemCard(
                         )
                     }
                     is ModelDownloadState.Error -> {
-                        IconButton(onClick = onStartDownload, modifier = Modifier.size(32.dp)) {
-                            Icon(imageVector = Icons.Default.Refresh, contentDescription = "Tentar novamente")
+                        IconButton(
+                            onClick = onStartDownload,
+                            modifier = Modifier
+                                .size(40.dp)
+                                .testTag("btn_retry_${model.id}")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "Tentar novamente download de ${model.name}",
+                                tint = MaterialTheme.colorScheme.error
+                            )
                         }
                     }
                     is ModelDownloadState.NotInstalled -> {
@@ -700,11 +1051,20 @@ fun ModelDownloadItemCard(
 
             if (state is ModelDownloadState.Error) {
                 Spacer(Modifier.height(6.dp))
-                Text(
-                    text = state.message,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Warning,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = state.message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
             }
         }
     }
