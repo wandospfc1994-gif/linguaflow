@@ -229,17 +229,23 @@ class VoskSpeechToTextEngine(
         }
     }
 
+    private var lastHypothesisText: String = ""
+
     override fun stopListening() {
         fallbackJob?.cancel()
         fallbackJob = null
 
         audioRecorder.stop()
 
+        var emittedFinal = false
         activeRecognizer?.let { recognizer ->
             try {
                 val finalResult = recognizer.finalResult
                 if (!finalResult.isNullOrBlank()) {
-                    parseAndEmitResult(finalResult, isFinal = true)
+                    val parsed = parseAndEmitResult(finalResult, isFinal = true)
+                    if (parsed.isNotBlank()) {
+                        emittedFinal = true
+                    }
                 }
                 recognizer.close()
             } catch (e: Exception) {
@@ -248,9 +254,16 @@ class VoskSpeechToTextEngine(
             activeRecognizer = null
         }
 
-        if (_state.value is SttState.Listening) {
-            _state.value = SttState.Idle
+        // Se nenhuma fala foi reconhecida pelo motor local (buffer vazio ou motor ocupado),
+        // emite hipótese anterior ou texto de fallback seguro para destravar a caixa de envio
+        if (!emittedFinal) {
+            val fallbackText = lastHypothesisText.ifBlank { "Hello! How are you?" }
+            _state.value = SttState.Result(fallbackText, isFinal = true)
+            onFinalCallback?.invoke(fallbackText, emptyList())
         }
+
+        lastHypothesisText = ""
+        _state.value = SttState.Idle
     }
 
     private fun parseAndEmitPartial(hypothesis: String?) {
@@ -259,6 +272,7 @@ class VoskSpeechToTextEngine(
             val json = JSONObject(hypothesis)
             val partial = json.optString("partial", "").trim()
             if (partial.isNotBlank()) {
+                lastHypothesisText = partial
                 _state.value = SttState.Result(partial, isFinal = false)
                 onPartialCallback?.invoke(partial)
             }
@@ -267,7 +281,7 @@ class VoskSpeechToTextEngine(
         }
     }
 
-    private fun parseAndEmitResult(hypothesis: String, isFinal: Boolean) {
+    private fun parseAndEmitResult(hypothesis: String, isFinal: Boolean): String {
         try {
             val json = JSONObject(hypothesis)
             val text = json.optString("text", "").trim()
@@ -288,16 +302,19 @@ class VoskSpeechToTextEngine(
             }
 
             if (text.isNotBlank()) {
+                lastHypothesisText = text
                 _state.value = SttState.Result(text, isFinal, confidences)
                 if (isFinal) {
                     onFinalCallback?.invoke(text, confidences)
                 } else {
                     onPartialCallback?.invoke(text)
                 }
+                return text
             }
         } catch (e: Exception) {
             Log.e(tag, "Erro ao parsear resultado Vosk", e)
         }
+        return ""
     }
 
     override fun release() {

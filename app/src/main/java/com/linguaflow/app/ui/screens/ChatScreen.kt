@@ -416,16 +416,17 @@ fun ChatScreen(
                         unfocusedContainerColor = MaterialTheme.colorScheme.surface
                     ),
                     maxLines = 3,
-                    enabled = chatUiState == ChatUiState.IDLE
+                    enabled = chatUiState != ChatUiState.THINKING
                 )
 
                 Spacer(Modifier.width(8.dp))
 
                 // Send Button
+                val canSend = inputText.isNotBlank() && chatUiState != ChatUiState.THINKING
                 IconButton(
                     onClick = {
                         val textToSend = inputText.trim()
-                        if (textToSend.isNotBlank() && chatUiState == ChatUiState.IDLE) {
+                        if (canSend) {
                             viewModel.sendMessage(textToSend)
                         }
                     },
@@ -433,11 +434,11 @@ fun ChatScreen(
                         .size(48.dp)
                         .clip(CircleShape)
                         .background(
-                            if (inputText.isNotBlank() && chatUiState == ChatUiState.IDLE) MaterialTheme.colorScheme.primary
+                            if (canSend) MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.surfaceVariant
                         )
                         .testTag("chat_send_button"),
-                    enabled = inputText.isNotBlank() && chatUiState == ChatUiState.IDLE
+                    enabled = canSend
                 ) {
                     if (chatUiState == ChatUiState.THINKING) {
                         CircularProgressIndicator(
@@ -449,7 +450,7 @@ fun ChatScreen(
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.Send,
                             contentDescription = "Enviar",
-                            tint = if (inputText.isNotBlank() && chatUiState == ChatUiState.IDLE) MaterialTheme.colorScheme.onPrimary
+                            tint = if (canSend) MaterialTheme.colorScheme.onPrimary
                             else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }

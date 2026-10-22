@@ -127,7 +127,11 @@ class TutorChatViewModel(
      */
     fun sendMessage(textToSend: String) {
         val trimmed = textToSend.trim()
-        if (trimmed.isBlank() || _uiState.value != ChatUiState.IDLE) return
+        if (trimmed.isBlank() || _uiState.value == ChatUiState.THINKING) return
+
+        // Interrompe qualquer escuta ou áudio anterior para focar na nova mensagem
+        sttEngine.stopListening()
+        ttsEngine.stop()
 
         // 1. Limpa caixa de texto e define estado para THINKING
         _inputText.value = ""
@@ -155,7 +159,7 @@ class TutorChatViewModel(
                     fullOutput.clear().append(chunk)
                 }
 
-                // 4. Parser rigoroso dos 3 blocos (<reply>, <fix>, <pron>) com limpeza de tags
+                // 4. Parser rigoroso com limpeza de tags
                 val finalFeedback: TutorFeedback = TutorResponseParser.parse(fullOutput.toString())
                 val cleanReply = finalFeedback.reply.ifBlank {
                     "Que ótimo! Vamos continuar praticando. Let's keep talking!"
@@ -213,12 +217,9 @@ class TutorChatViewModel(
                 _inputText.value = partial
             },
             onFinal = { text, _ ->
-                _inputText.value = text
-                if (text.isNotBlank()) {
-                    sendMessage(text)
-                } else if (_uiState.value == ChatUiState.LISTENING || _uiState.value == ChatUiState.TRANSCRIBING) {
-                    _uiState.value = ChatUiState.IDLE
-                }
+                val resolved = text.ifBlank { "Hello! How are you?" }
+                _inputText.value = resolved
+                _uiState.value = ChatUiState.IDLE
             },
             onError = { err ->
                 Log.e(tag, "Erro no motor STT: $err")
@@ -230,12 +231,14 @@ class TutorChatViewModel(
     }
 
     /**
-     * Interrompe a escuta do microfone e restabelece o estado IDLE se necessário.
+     * Interrompe a escuta do microfone e restabelece o estado IDLE imediatamente,
+     * garantindo que a caixa de texto seja preenchida caso estivesse vazia.
      */
     fun stopListening() {
         sttEngine.stopListening()
-        if (_uiState.value == ChatUiState.LISTENING || _uiState.value == ChatUiState.TRANSCRIBING) {
-            _uiState.value = ChatUiState.IDLE
+        _uiState.value = ChatUiState.IDLE
+        if (_inputText.value.isBlank()) {
+            _inputText.value = "Hello! How are you?"
         }
     }
 
