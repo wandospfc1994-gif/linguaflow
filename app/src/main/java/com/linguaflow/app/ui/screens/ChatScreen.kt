@@ -87,6 +87,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.linguaflow.app.data.local.entity.MessageEntity
 import com.linguaflow.app.data.model.TutorFeedback
 import com.linguaflow.app.data.repository.LinguaflowRepository
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.linguaflow.app.engine.SpeechToTextEngine
 import com.linguaflow.app.engine.SttState
 import com.linguaflow.app.engine.TextToSpeechEngine
@@ -94,6 +95,7 @@ import com.linguaflow.app.engine.TtsPlaybackState
 import com.linguaflow.app.engine.TutorLlmEngine
 import com.linguaflow.app.engine.llm.TutorResponseParser
 import com.linguaflow.app.ui.state.ChatUiState
+import com.linguaflow.app.ui.viewmodel.TutorChatViewModel
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -103,56 +105,41 @@ fun ChatScreen(
     ttsEngine: TextToSpeechEngine,
     tutorLlm: TutorLlmEngine,
     sttEngine: SpeechToTextEngine,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    viewModel: TutorChatViewModel = viewModel(
+        factory = TutorChatViewModel.provideFactory(repository, tutorLlm, ttsEngine, sttEngine)
+    )
 ) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
 
-    val messages by repository.getMessages(1L).collectAsStateWithLifecycle(initialValue = emptyList())
-    val playbackState by ttsEngine.playbackState.collectAsStateWithLifecycle()
-    val sttState by sttEngine.state.collectAsStateWithLifecycle()
+    val messages by viewModel.messages.collectAsStateWithLifecycle()
+    val playbackState by viewModel.playbackState.collectAsStateWithLifecycle()
+    val chatUiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val inputText by viewModel.inputText.collectAsStateWithLifecycle()
+    val streamingRawText by viewModel.streamingRawText.collectAsStateWithLifecycle()
+    val speechRate by viewModel.speechRate.collectAsStateWithLifecycle()
+    val errorMessage by viewModel.errorMessage.collectAsStateWithLifecycle()
 
-    var chatUiState by remember { mutableStateOf(ChatUiState.IDLE) }
-    var inputText by remember { mutableStateOf("") }
-    var speechRate by remember { mutableFloatStateOf(1.0f) }
-    var streamingRawText by remember { mutableStateOf("") }
     var showPermissionDeniedDialog by remember { mutableStateOf(false) }
 
-    // Sync ChatUiState with TTS playback (prevent echo by locking mic during speaking)
-    LaunchedEffect(playbackState) {
-        if (playbackState is TtsPlaybackState.Speaking) {
-            chatUiState = ChatUiState.SPEAKING
-            sttEngine.stopListening()
-        } else if (chatUiState == ChatUiState.SPEAKING) {
-            chatUiState = ChatUiState.IDLE
-        }
-    }
-
-    // Sync ChatUiState with STT
-    LaunchedEffect(sttState) {
-        when (sttState) {
-            is SttState.Listening -> chatUiState = ChatUiState.LISTENING
-            is SttState.Transcribing -> chatUiState = ChatUiState.TRANSCRIBING
-            is SttState.Idle -> {
-                if (chatUiState == ChatUiState.LISTENING || chatUiState == ChatUiState.TRANSCRIBING) {
-                    chatUiState = ChatUiState.IDLE
-                }
-            }
-            else -> {}
+    LaunchedEffect(errorMessage) {
+        errorMessage?.let { err ->
+            Toast.makeText(context, err, Toast.LENGTH_SHORT).show()
+            viewModel.clearErrorMessage()
         }
     }
 
     androidx.activity.compose.BackHandler {
-        ttsEngine.stop()
-        sttEngine.stopListening()
+        viewModel.stopTts()
+        viewModel.stopListening()
         onBack()
     }
 
     DisposableEffect(Unit) {
         onDispose {
-            ttsEngine.stop()
-            sttEngine.stopListening()
+            viewModel.stopTts()
+            viewModel.stopListening()
         }
     }
 
@@ -160,28 +147,9 @@ fun ChatScreen(
         contract = ActivityResultContracts.RequestPermission()
     ) { isGranted ->
         if (isGranted) {
-            startListeningFlow(
-                sttEngine = sttEngine,
-                onPartial = { partial -> inputText = partial },
-                onFinal = { text ->
-                    inputText = text
-                    sendMessageAndTriggerTutor(
-                        textToSend = text,
-                        messages = messages,
-                        repository = repository,
-                        tutorLlm = tutorLlm,
-                        ttsEngine = ttsEngine,
-                        onStateChange = { chatUiState = it },
-                        onStreamingChunk = { streamingRawText = it },
-                        onFinish = {
-                            inputText = ""
-                            streamingRawText = ""
-                        }
-                    )
-                },
+            viewModel.startListening(
                 onError = { err ->
                     Toast.makeText(context, err, Toast.LENGTH_SHORT).show()
-                    chatUiState = ChatUiState.IDLE
                 }
             )
         } else {
@@ -256,12 +224,7 @@ fun ChatScreen(
                 actions = {
                     IconButton(
                         onClick = {
-                            ttsEngine.stop()
-                            sttEngine.stopListening()
-                            scope.launch {
-                                repository.clearMessages(1L)
-                                repository.createInitialConversationIfNeeded()
-                            }
+                            viewModel.clearChat()
                         },
                         modifier = Modifier.testTag("clear_chat_button")
                     ) {
@@ -309,8 +272,7 @@ fun ChatScreen(
                         FilterChip(
                             selected = isSelected,
                             onClick = {
-                                speechRate = rate
-                                ttsEngine.setSpeechRate(rate)
+                                viewModel.setSpeechRate(rate)
                             },
                             label = { Text(label, fontSize = 11.sp) },
                             modifier = Modifier.height(26.dp),
@@ -340,12 +302,7 @@ fun ChatScreen(
                         message = msg,
                         playbackState = playbackState,
                         onPlayTts = {
-                            val id = msg.id.toString()
-                            if (playbackState is TtsPlaybackState.Speaking && (playbackState as TtsPlaybackState.Speaking).utteranceId == id) {
-                                ttsEngine.stop()
-                            } else {
-                                ttsEngine.speak(msg.content, utteranceId = id)
-                            }
+                            viewModel.playTtsForMessage(msg)
                         }
                     )
                 }
@@ -378,7 +335,7 @@ fun ChatScreen(
                             .clip(RoundedCornerShape(16.dp))
                             .background(MaterialTheme.colorScheme.surfaceVariant)
                             .clickable(enabled = chatUiState == ChatUiState.IDLE) {
-                                inputText = suggestion
+                                viewModel.onInputTextChanged(suggestion)
                             }
                             .padding(horizontal = 12.dp, vertical = 6.dp)
                     ) {
@@ -411,8 +368,7 @@ fun ChatScreen(
                                 ).show()
                             }
                             ChatUiState.LISTENING -> {
-                                sttEngine.stopListening()
-                                chatUiState = ChatUiState.IDLE
+                                viewModel.stopListening()
                             }
                             ChatUiState.IDLE -> {
                                 val hasPermission = ContextCompat.checkSelfPermission(
@@ -421,28 +377,9 @@ fun ChatScreen(
                                 ) == PackageManager.PERMISSION_GRANTED
 
                                 if (hasPermission) {
-                                    startListeningFlow(
-                                        sttEngine = sttEngine,
-                                        onPartial = { inputText = it },
-                                        onFinal = { text ->
-                                            inputText = text
-                                            sendMessageAndTriggerTutor(
-                                                textToSend = text,
-                                                messages = messages,
-                                                repository = repository,
-                                                tutorLlm = tutorLlm,
-                                                ttsEngine = ttsEngine,
-                                                onStateChange = { chatUiState = it },
-                                                onStreamingChunk = { streamingRawText = it },
-                                                onFinish = {
-                                                    inputText = ""
-                                                    streamingRawText = ""
-                                                }
-                                            )
-                                        },
+                                    viewModel.startListening(
                                         onError = { err ->
                                             Toast.makeText(context, err, Toast.LENGTH_SHORT).show()
-                                            chatUiState = ChatUiState.IDLE
                                         }
                                     )
                                 } else {
@@ -458,7 +395,7 @@ fun ChatScreen(
 
                 OutlinedTextField(
                     value = inputText,
-                    onValueChange = { inputText = it },
+                    onValueChange = { viewModel.onInputTextChanged(it) },
                     placeholder = {
                         Text(
                             when (chatUiState) {
@@ -489,19 +426,7 @@ fun ChatScreen(
                     onClick = {
                         val textToSend = inputText.trim()
                         if (textToSend.isNotBlank() && chatUiState == ChatUiState.IDLE) {
-                            inputText = ""
-                            sendMessageAndTriggerTutor(
-                                textToSend = textToSend,
-                                messages = messages,
-                                repository = repository,
-                                tutorLlm = tutorLlm,
-                                ttsEngine = ttsEngine,
-                                onStateChange = { chatUiState = it },
-                                onStreamingChunk = { streamingRawText = it },
-                                onFinish = {
-                                    streamingRawText = ""
-                                }
-                            )
+                            viewModel.sendMessage(textToSend)
                         }
                     },
                     modifier = Modifier
@@ -561,76 +486,6 @@ fun ChatScreen(
                 OutlinedButton(onClick = { showPermissionDeniedDialog = false }) {
                     Text("Cancelar")
                 }
-            }
-        )
-    }
-}
-
-private fun startListeningFlow(
-    sttEngine: SpeechToTextEngine,
-    onPartial: (String) -> Unit,
-    onFinal: (String) -> Unit,
-    onError: (String) -> Unit
-) {
-    sttEngine.startListening(
-        onPartial = onPartial,
-        onFinal = { text, _ -> onFinal(text) },
-        onError = onError
-    )
-}
-
-private fun sendMessageAndTriggerTutor(
-    textToSend: String,
-    messages: List<MessageEntity>,
-    repository: LinguaflowRepository,
-    tutorLlm: TutorLlmEngine,
-    ttsEngine: TextToSpeechEngine,
-    onStateChange: (ChatUiState) -> Unit,
-    onStreamingChunk: (String) -> Unit,
-    onFinish: () -> Unit
-) {
-    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
-        repository.sendMessage(textToSend, 1L)
-        onStateChange(ChatUiState.THINKING)
-
-        val fullOutput = StringBuilder()
-        tutorLlm.generateTutorReplyStream(
-            prompt = textToSend,
-            history = messages,
-            userLevel = "A1",
-            targetLanguage = "Inglês"
-        ).collect { chunk ->
-            onStreamingChunk(chunk)
-            fullOutput.clear().append(chunk)
-        }
-
-        val finalFeedback = TutorResponseParser.parse(fullOutput.toString())
-
-        val storedMetadata = buildString {
-            append("<reply>${finalFeedback.reply}</reply>")
-            if (finalFeedback.hasCorrections) {
-                append("<fix>${finalFeedback.corrections}</fix>")
-            }
-            if (finalFeedback.hasPronunciationTip) {
-                append("<pron>${finalFeedback.pronunciationTip}</pron>")
-            }
-        }
-
-        val newMsgId = repository.saveAssistantMessage(
-            content = finalFeedback.reply.ifBlank { "That sounds great! Keep practicing." },
-            conversationId = 1L,
-            translation = storedMetadata
-        )
-
-        onFinish()
-        onStateChange(ChatUiState.SPEAKING)
-
-        // Automatic fluid TTS audio playback with onDone transition back to IDLE
-        ttsEngine.speak(
-            text = finalFeedback.reply,
-            utteranceId = newMsgId.toString(),
-            onDone = {
-                onStateChange(ChatUiState.IDLE)
             }
         )
     }

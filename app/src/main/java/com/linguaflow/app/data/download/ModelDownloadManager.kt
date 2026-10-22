@@ -42,9 +42,15 @@ class ModelDownloadManager(
     private val tag = "ModelDownloadManager"
     private val prefs = context.getSharedPreferences("linguaflow_models_auth", Context.MODE_PRIVATE)
 
+    // DIRETÓRIO PERMANENTE: Salva SEMPRE em context.filesDir/models (nunca em cacheDir)
     private val modelsDir: File = File(context.filesDir, "models").apply {
-        if (!exists()) mkdirs()
+        if (!exists()) {
+            mkdirs()
+        }
     }
+
+    val modelsDirectory: File
+        get() = modelsDir
 
     private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(45, TimeUnit.SECONDS)
@@ -116,12 +122,64 @@ class ModelDownloadManager(
 
     private fun getPartFile(model: ModelInfo): File = File(modelsDir, "${model.fileName}.part")
 
+    /**
+     * Verificação física e estrita da existência e integridade do modelo no filesDir/models.
+     * Retorna true se o arquivo existe e seu tamanho corresponde ao esperado para uso offline.
+     */
+    fun isModelPhysicallyInstalled(model: ModelInfo): Boolean {
+        val file = getModelFile(model)
+
+        // Verificação específica para Vosk STT (pode ser o zip ou a pasta descompactada)
+        if (model.id == ModelCatalog.STT_VOSK_EN.id) {
+            if (file.exists() && file.length() >= 35_000_000L) {
+                prefs.edit().putBoolean("model_verified_${model.id}", true).apply()
+                return true
+            }
+            val extractedDir = File(modelsDir, "vosk-model-small-en-us-0.15")
+            if (extractedDir.exists() && File(extractedDir, "am").exists()) {
+                prefs.edit().putBoolean("model_verified_${model.id}", true).apply()
+                return true
+            }
+        }
+
+        // Verificação específica para Gemma 2B LLM (mínimo de ~500MB para modelo quantizado int4 funcional)
+        if (model.id == ModelCatalog.LLM_GEMMA_2B.id) {
+            if (file.exists() && file.length() >= 500_000_000L) {
+                prefs.edit().putBoolean("model_verified_${model.id}", true).apply()
+                return true
+            }
+            // Verifica se há outro arquivo compatível .bin ou .task com peso substancial
+            val candidate = modelsDir.listFiles { f ->
+                (f.name.endsWith(".bin") || f.name.endsWith(".task")) && f.length() >= 500_000_000L
+            }?.firstOrNull()
+            if (candidate != null) {
+                prefs.edit().putBoolean("model_verified_${model.id}", true).apply()
+                return true
+            }
+        }
+
+        // Verificação genérica para outros modelos com tolerância razoável de compressão
+        if (file.exists()) {
+            val minExpected = if (model.approximateSizeBytes > 0) {
+                (model.approximateSizeBytes * 0.70).toLong()
+            } else 100_000L
+
+            if (file.length() >= minExpected) {
+                prefs.edit().putBoolean("model_verified_${model.id}", true).apply()
+                return true
+            }
+        }
+
+        return false
+    }
+
     fun refreshAllStates() {
         val newStates = mutableMapOf<String, ModelDownloadState>()
         for (model in ModelCatalog.allModels) {
             val file = getModelFile(model)
-            if (file.exists() && file.length() > 0) {
-                newStates[model.id] = ModelDownloadState.Installed(file.length())
+            if (isModelPhysicallyInstalled(model)) {
+                val size = if (file.exists()) file.length() else model.approximateSizeBytes
+                newStates[model.id] = ModelDownloadState.Installed(size)
             } else {
                 val current = _downloadStates.value[model.id]
                 if (current !is ModelDownloadState.Downloading &&
@@ -138,12 +196,13 @@ class ModelDownloadManager(
         _downloadStates.value = newStates
     }
 
+    /**
+     * Verifica se os modelos mínimos essenciais para o funcionamento do app estão
+     * instalados fisicamente no filesDir/models com tamanho esperado.
+     */
     fun hasMinimumRequiredModels(): Boolean {
         val required = ModelCatalog.allModels.filter { it.isRequired }
-        return required.all { model ->
-            val file = getModelFile(model)
-            file.exists() && file.length() > 0
-        }
+        return required.all { model -> isModelPhysicallyInstalled(model) }
     }
 
     /**
@@ -153,13 +212,17 @@ class ModelDownloadManager(
     fun startAutoDownloadMissingRequiredModels() {
         val required = ModelCatalog.allModels.filter { it.isRequired }
         for (model in required) {
-            val file = getModelFile(model)
+            if (isModelPhysicallyInstalled(model)) {
+                updateState(model.id, ModelDownloadState.Installed(getModelFile(model).length()))
+                continue
+            }
+
             val currentState = _downloadStates.value[model.id]
             val isBusyOrBlocked = currentState is ModelDownloadState.Downloading ||
                 currentState is ModelDownloadState.Verifying ||
                 currentState is ModelDownloadState.RequiresAuth ||
                 currentState is ModelDownloadState.Error
-            if ((!file.exists() || file.length() == 0L) && !isBusyOrBlocked) {
+            if (!isBusyOrBlocked) {
                 Log.d(tag, "Iniciando download automático para o modelo: ${model.name}")
                 startDownload(model)
             }
@@ -167,6 +230,12 @@ class ModelDownloadManager(
     }
 
     fun startDownload(model: ModelInfo) {
+        if (isModelPhysicallyInstalled(model)) {
+            Log.d(tag, "Modelo ${model.id} já está instalado e verificado em filesDir/models. Pulando download.")
+            updateState(model.id, ModelDownloadState.Installed(getModelFile(model).length()))
+            return
+        }
+
         val existingJob = activeJobs[model.id]
         if (existingJob != null && existingJob.isActive) return
 
@@ -222,6 +291,24 @@ class ModelDownloadManager(
         updateState(model.id, ModelDownloadState.NotInstalled)
     }
 
+    suspend fun importFromFileUri(model: ModelInfo, uri: Uri): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val targetFile = getModelFile(model)
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(targetFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            prefs.edit().putBoolean("model_verified_${model.id}", true).apply()
+            updateState(model.id, ModelDownloadState.Installed(targetFile.length()))
+            true
+        } catch (e: Exception) {
+            Log.e(tag, "Erro ao importar arquivo do URI para ${model.id}", e)
+            updateState(model.id, ModelDownloadState.Error("Falha na importação: ${e.message}"))
+            false
+        }
+    }
+
     private suspend fun downloadInternal(model: ModelInfo): Unit = withContext(Dispatchers.IO) {
         var activeModel = model
         val targetFile = getModelFile(activeModel)
@@ -251,7 +338,6 @@ class ModelDownloadManager(
                 }
 
                 // SOMENTE adiciona Authorization ou Cookies se o modelo exigir autenticação privada
-                // Para mirrors públicos (requiresAuth = false), nunca envia cabeçalhos vazios ou desnecessários
                 if (activeModel.requiresAuth) {
                     val token = getAuthToken()
                     if (!token.isNullOrBlank() && token.trim().length > 3) {
@@ -271,8 +357,7 @@ class ModelDownloadManager(
                 val isPartial = responseCode == 206
                 val isFull = responseCode == 200
 
-                // Redundância inteligente: se a URL do Gemma retornar 401 ou 404 para modelo público (sem token),
-                // alterna imediatamente para o mirror verificado sem abrir janelas interativas nem pedir token
+                // Redundância inteligente para mirrors públicos
                 if ((responseCode == 401 || responseCode == 404) && !activeModel.requiresAuth && activeModel.id == ModelCatalog.LLM_GEMMA_2B.id && activeModel.url != ModelCatalog.GEMMA_VERIFIED_MIRROR_URL) {
                     Log.w(tag, "HTTP $responseCode no mirror primário. Alternando para o mirror público verificado: ${ModelCatalog.GEMMA_VERIFIED_MIRROR_URL}")
                     activeModel = activeModel.copy(url = ModelCatalog.GEMMA_VERIFIED_MIRROR_URL)
@@ -307,7 +392,7 @@ class ModelDownloadManager(
                 }
 
                 if (responseCode == 416) {
-                    if (existingBytes >= (model.approximateSizeBytes * 0.95)) {
+                    if (existingBytes >= (model.approximateSizeBytes * 0.90)) {
                         isCompleted = true
                         break
                     } else {
@@ -417,6 +502,7 @@ class ModelDownloadManager(
 
         if (partFile.renameTo(targetFile)) {
             Log.d(tag, "Modelo ${model.id} salvo com sucesso em ${targetFile.absolutePath}")
+            prefs.edit().putBoolean("model_verified_${model.id}", true).apply()
             updateState(model.id, ModelDownloadState.Installed(targetFile.length()))
         } else {
             updateState(model.id, ModelDownloadState.Error("Não foi possível finalizar o arquivo no armazenamento."))
@@ -424,8 +510,7 @@ class ModelDownloadManager(
     }
 
     /**
-     * Valida o token e permissões de acesso ao repositório Gemma 2B via API do Hugging Face,
-     * retornando códigos HTTP exatos para diagnóstico transparente.
+     * Valida o token e permissões de acesso ao repositório Gemma 2B via API do Hugging Face.
      */
     suspend fun verifyHfAccess(token: String): HfAuthStatus = withContext(Dispatchers.IO) {
         val trimmed = token.trim()
@@ -448,71 +533,40 @@ class ModelDownloadManager(
                 return@withContext HfAuthStatus.NetworkError("Erro HTTP $whoamiCode na verificação da conta", whoamiCode)
             }
 
-            val whoamiBody = whoamiResp.body?.string() ?: ""
             val username = try {
-                JSONObject(whoamiBody).optString("name", "Usuário")
+                val json = JSONObject(whoamiResp.body?.string() ?: "{}")
+                json.optString("name", "Usuário HF")
             } catch (e: Exception) {
-                "Usuário"
+                "Usuário HF"
             }
 
-            // Testa acesso ao repositório do Gemma 2B
+            // Testa acesso direto ao repositório do Gemma 2B
             val gemmaReq = Request.Builder()
-                .url("https://huggingface.co/api/models/google/gemma-2b-it")
+                .url("https://huggingface.co/google/gemma-2b-it/resolve/main/config.json")
                 .header("Authorization", "Bearer $trimmed")
                 .header("User-Agent", "Linguaflow-Android/1.0")
+                .head()
                 .build()
 
             val gemmaResp = okHttpClient.newCall(gemmaReq).execute()
             val gemmaCode = gemmaResp.code
 
-            when (gemmaCode) {
-                200 -> HfAuthStatus.Success(username = username, hasGemmaAccess = true, httpCode = 200)
-                403 -> HfAuthStatus.TermsRequired(username = username, httpCode = 403)
-                401 -> HfAuthStatus.InvalidToken(401)
-                else -> HfAuthStatus.Success(username = username, hasGemmaAccess = false, httpCode = gemmaCode)
-            }
-        } catch (e: Exception) {
-            HfAuthStatus.NetworkError(e.localizedMessage ?: "Erro de conexão com o servidor")
-        }
-    }
-
-    suspend fun importFromFileUri(model: ModelInfo, uri: Uri) = withContext(Dispatchers.IO) {
-        val targetFile = getModelFile(model)
-        updateState(model.id, ModelDownloadState.Verifying("Importando e validando arquivo..."))
-
-        try {
-            val contentResolver = context.contentResolver
-            val inputStream: InputStream? = contentResolver.openInputStream(uri)
-
-            if (inputStream == null) {
-                updateState(model.id, ModelDownloadState.Error("Não foi possível abrir o arquivo selecionado."))
-                return@withContext
-            }
-
-            val tempFile = File(modelsDir, "${model.fileName}.temp")
-            inputStream.use { input ->
-                FileOutputStream(tempFile).use { output ->
-                    input.copyTo(output, bufferSize = 65536)
+            return@withContext when (gemmaCode) {
+                200 -> HfAuthStatus.Success(username, hasGemmaAccess = true, httpCode = 200)
+                403 -> HfAuthStatus.TermsRequired(username, httpCode = 403)
+                401 -> HfAuthStatus.InvalidToken(httpCode = 401)
+                else -> {
+                    if (gemmaResp.isSuccessful) {
+                        HfAuthStatus.Success(username, hasGemmaAccess = true, httpCode = gemmaCode)
+                    } else {
+                        HfAuthStatus.TermsRequired(username, httpCode = gemmaCode)
+                    }
                 }
             }
-
-            if (tempFile.renameTo(targetFile)) {
-                updateState(model.id, ModelDownloadState.Installed(targetFile.length()))
-            } else {
-                updateState(model.id, ModelDownloadState.Error("Falha ao salvar o arquivo importado."))
-            }
-        } catch (err: Exception) {
-            updateState(model.id, ModelDownloadState.Error("Erro na importação: ${err.localizedMessage}"))
+        } catch (e: Exception) {
+            Log.e(tag, "Exceção ao validar token Hugging Face", e)
+            return@withContext HfAuthStatus.NetworkError("Falha de conexão: ${e.localizedMessage}")
         }
-    }
-
-    fun deleteModel(model: ModelInfo) {
-        cancelDownload(model)
-        val file = getModelFile(model)
-        if (file.exists()) {
-            file.delete()
-        }
-        updateState(model.id, ModelDownloadState.NotInstalled)
     }
 
     private fun updateState(modelId: String, state: ModelDownloadState) {
@@ -521,18 +575,20 @@ class ModelDownloadManager(
         _downloadStates.value = current
     }
 
-    private fun calculateSha256(file: File): String {
+    fun calculateSha256(file: File): String {
+        if (!file.exists()) return ""
         return try {
             val digest = MessageDigest.getInstance("SHA-256")
             file.inputStream().use { input ->
-                val buffer = ByteArray(65536)
-                var read: Int
-                while (input.read(buffer).also { read = it } != -1) {
-                    digest.update(buffer, 0, read)
+                val buffer = ByteArray(8192)
+                var bytesRead: Int
+                while (input.read(buffer).also { bytesRead = it } != -1) {
+                    digest.update(buffer, 0, bytesRead)
                 }
             }
             digest.digest().joinToString("") { "%02x".format(it) }
         } catch (e: Exception) {
+            Log.w(tag, "Erro ao calcular SHA256", e)
             ""
         }
     }

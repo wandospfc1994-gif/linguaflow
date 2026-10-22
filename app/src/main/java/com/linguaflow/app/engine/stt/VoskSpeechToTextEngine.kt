@@ -7,6 +7,7 @@ import com.linguaflow.app.data.model.ModelCatalog
 import com.linguaflow.app.engine.SpeechToTextEngine
 import com.linguaflow.app.engine.SttState
 import com.linguaflow.app.engine.WordConfidence
+import com.linguaflow.app.engine.audio.AudioRecorder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -19,8 +20,6 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
-import org.vosk.android.RecognitionListener
-import org.vosk.android.SpeechService
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -30,7 +29,7 @@ class VoskSpeechToTextEngine(
     private val context: Context,
     private val modelManager: ModelDownloadManager,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
-) : SpeechToTextEngine, RecognitionListener {
+) : SpeechToTextEngine {
 
     private val tag = "VoskSttEngine"
 
@@ -38,7 +37,8 @@ class VoskSpeechToTextEngine(
     override val state: StateFlow<SttState> = _state.asStateFlow()
 
     private var voskModel: Model? = null
-    private var speechService: SpeechService? = null
+    private var activeRecognizer: Recognizer? = null
+    private val audioRecorder = AudioRecorder(sampleRate = 16000, scope = scope)
     private var isModelLoading = false
 
     private var onPartialCallback: ((String) -> Unit)? = null
@@ -68,17 +68,17 @@ class VoskSpeechToTextEngine(
                 return@withContext true
             }
         } catch (e: Exception) {
-            Log.w(tag, "Erro ao carregar modelo Vosk: ${e.message}", e)
+            Log.e(tag, "Erro ao carregar modelo Vosk: ${e.message}", e)
         }
         isModelLoading = false
         return@withContext false
     }
 
     private fun getOrExtractModelDirectory(): File? {
-        val modelsDir = File(context.filesDir, "models")
+        val modelsDir = modelManager.modelsDirectory
         if (!modelsDir.exists()) return null
 
-        // Check if an unzipped folder already exists
+        // Verifica se pasta já descompactada existe
         val existingFolder = modelsDir.listFiles { file ->
             file.isDirectory && file.name.contains("vosk", ignoreCase = true)
         }?.firstOrNull()
@@ -87,7 +87,7 @@ class VoskSpeechToTextEngine(
             return existingFolder
         }
 
-        // Check for downloaded zip
+        // Verifica zip baixado
         val zipFile = modelManager.getModelFile(ModelCatalog.STT_VOSK_EN)
         if (zipFile.exists() && zipFile.length() > 100_000L) {
             try {
@@ -128,7 +128,7 @@ class VoskSpeechToTextEngine(
     }
 
     override fun isListening(): Boolean {
-        return _state.value is SttState.Listening || speechService != null
+        return _state.value is SttState.Listening || audioRecorder.isRecording.value
     }
 
     override fun startListening(
@@ -142,29 +142,51 @@ class VoskSpeechToTextEngine(
         onFinalCallback = onFinal
         onErrorCallback = onError
 
-        _state.value = SttState.Listening
-
         scope.launch {
             val ready = initModelIfNeeded()
             val model = voskModel
 
             if (ready && model != null) {
-                withContext(Dispatchers.Main) {
-                    try {
-                        val recognizer = Recognizer(model, 16000.0f)
-                        recognizer.setWords(true) // Enables word confidence and timestamps
+                try {
+                    val recognizer = Recognizer(model, 16000.0f)
+                    recognizer.setWords(true)
+                    activeRecognizer = recognizer
 
-                        val service = SpeechService(recognizer, 16000.0f)
-                        speechService = service
-                        service.startListening(this@VoskSpeechToTextEngine)
-                        Log.d(tag, "Vosk SpeechService iniciado.")
-                    } catch (e: Exception) {
-                        Log.w(tag, "Falha ao iniciar SpeechService nativo, acionando fallback", e)
+                    val started = audioRecorder.start(
+                        onAudioChunk = { pcmChunk, bytesRead ->
+                            try {
+                                if (recognizer.acceptWaveForm(pcmChunk, bytesRead)) {
+                                    val res = recognizer.result
+                                    parseAndEmitResult(res, isFinal = false)
+                                } else {
+                                    val partial = recognizer.partialResult
+                                    parseAndEmitPartial(partial)
+                                }
+                            } catch (e: Exception) {
+                                Log.e(tag, "Erro ao processar chunk PCM no Vosk Recognizer", e)
+                            }
+                        },
+                        onStarted = {
+                            _state.value = SttState.Listening
+                            Log.d(tag, "AudioRecorder conectado ao Vosk Recognizer com sucesso.")
+                        },
+                        onError = { err ->
+                            Log.e(tag, "Falha no AudioRecord nativo: $err")
+                            _state.value = SttState.Error(err)
+                            onErrorCallback?.invoke(err)
+                        }
+                    )
+
+                    if (!started) {
+                        Log.w(tag, "AudioRecorder não pôde iniciar gravação, usando modo fallback interativo.")
                         startFallbackListening()
                     }
+                } catch (e: Exception) {
+                    Log.e(tag, "Erro ao instanciar Vosk Recognizer nativo", e)
+                    startFallbackListening()
                 }
             } else {
-                Log.d(tag, "Modelo Vosk não disponível localmente, usando modo interativo")
+                Log.d(tag, "Modelo Vosk não disponível localmente, usando modo interativo.")
                 startFallbackListening()
             }
         }
@@ -205,14 +227,19 @@ class VoskSpeechToTextEngine(
         fallbackJob?.cancel()
         fallbackJob = null
 
-        speechService?.let { service ->
+        audioRecorder.stop()
+
+        activeRecognizer?.let { recognizer ->
             try {
-                service.stop()
-                service.shutdown()
+                val finalResult = recognizer.finalResult
+                if (!finalResult.isNullOrBlank()) {
+                    parseAndEmitResult(finalResult, isFinal = true)
+                }
+                recognizer.close()
             } catch (e: Exception) {
-                Log.w(tag, "Erro ao parar speechService", e)
+                Log.e(tag, "Erro ao fechar Vosk Recognizer", e)
             }
-            speechService = null
+            activeRecognizer = null
         }
 
         if (_state.value is SttState.Listening) {
@@ -220,7 +247,7 @@ class VoskSpeechToTextEngine(
         }
     }
 
-    override fun onPartialResult(hypothesis: String?) {
+    private fun parseAndEmitPartial(hypothesis: String?) {
         if (hypothesis == null) return
         try {
             val json = JSONObject(hypothesis)
@@ -230,19 +257,8 @@ class VoskSpeechToTextEngine(
                 onPartialCallback?.invoke(partial)
             }
         } catch (e: Exception) {
-            Log.w(tag, "Erro ao parsear partial", e)
+            Log.w(tag, "Erro ao parsear partial do Vosk", e)
         }
-    }
-
-    override fun onResult(hypothesis: String?) {
-        if (hypothesis == null) return
-        parseAndEmitResult(hypothesis, isFinal = false)
-    }
-
-    override fun onFinalResult(hypothesis: String?) {
-        if (hypothesis == null) return
-        parseAndEmitResult(hypothesis, isFinal = true)
-        stopListening()
     }
 
     private fun parseAndEmitResult(hypothesis: String, isFinal: Boolean) {
@@ -276,19 +292,6 @@ class VoskSpeechToTextEngine(
         } catch (e: Exception) {
             Log.e(tag, "Erro ao parsear resultado Vosk", e)
         }
-    }
-
-    override fun onError(exception: Exception?) {
-        val msg = exception?.localizedMessage ?: "Erro no reconhecimento de voz"
-        Log.e(tag, "Vosk error: $msg")
-        _state.value = SttState.Error(msg)
-        onErrorCallback?.invoke(msg)
-        stopListening()
-    }
-
-    override fun onTimeout() {
-        Log.d(tag, "Vosk timeout")
-        stopListening()
     }
 
     override fun release() {

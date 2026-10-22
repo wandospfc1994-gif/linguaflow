@@ -43,82 +43,128 @@ class AudioRecorder(
         try {
             val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
             if (minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
-                val msg = "Configuração de áudio (16kHz mono 16-bit) incompatível com o hardware."
-                Log.e(tag, msg)
+                val msg = "Configuração de áudio PCM (16kHz mono 16-bit) não suportada pelo hardware do dispositivo."
+                Log.e(tag, "Erro de buffer AudioRecord: $msg (minBufferSize=$minBufferSize)")
                 withContext(Dispatchers.Main) { onError(msg) }
                 return@withContext false
             }
 
-            val bufferSize = (minBufferSize * 2).coerceAtLeast(3200)
+            val bufferSize = maxOf(minBufferSize * 2, 4096)
 
-            val record = AudioRecord(
+            // Tenta inicializar com VOICE_RECOGNITION, com fallback automático para MIC
+            var record: AudioRecord? = null
+            val audioSources = listOf(
                 MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                sampleRate,
-                channelConfig,
-                audioFormat,
-                bufferSize
+                MediaRecorder.AudioSource.MIC
             )
 
-            if (record.state != AudioRecord.STATE_INITIALIZED) {
-                record.release()
-                val msg = "Falha ao inicializar o hardware AudioRecord."
+            for (source in audioSources) {
+                try {
+                    val candidate = AudioRecord(
+                        source,
+                        sampleRate,
+                        channelConfig,
+                        audioFormat,
+                        bufferSize
+                    )
+                    if (candidate.state == AudioRecord.STATE_INITIALIZED) {
+                        record = candidate
+                        Log.d(tag, "AudioRecord inicializado com sucesso usando AudioSource $source (bufferSize=$bufferSize).")
+                        break
+                    } else {
+                        Log.w(tag, "AudioRecord falhou na inicialização com AudioSource $source (state=${candidate.state}). Tentando próximo...")
+                        candidate.release()
+                    }
+                } catch (e: Exception) {
+                    Log.e(tag, "Exceção ao instanciar AudioRecord com AudioSource $source", e)
+                }
+            }
+
+            if (record == null) {
+                val msg = "Falha ao inicializar o hardware de áudio do microfone em todas as fontes nativas."
                 Log.e(tag, msg)
                 withContext(Dispatchers.Main) { onError(msg) }
                 return@withContext false
             }
 
             audioRecord = record
-            record.startRecording()
+
+            try {
+                record.startRecording()
+            } catch (e: Exception) {
+                Log.e(tag, "Exceção ao chamar startRecording no AudioRecord", e)
+                cleanUp()
+                withContext(Dispatchers.Main) { onError("Não foi possível iniciar a gravação: ${e.localizedMessage}") }
+                return@withContext false
+            }
 
             if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                record.stop()
-                record.release()
-                audioRecord = null
-                val msg = "Microfone ocupado por outro processo ou indisponível."
+                val msg = "Microfone bloqueado ou ocupado por outro processo do sistema (recordingState=${record.recordingState})."
                 Log.e(tag, msg)
+                cleanUp()
                 withContext(Dispatchers.Main) { onError(msg) }
                 return@withContext false
             }
 
             _isRecording.value = true
 
-            // Confirmação segura: o estado "Escutando" só é disparado APÓS confirmação de gravação do hardware
             withContext(Dispatchers.Main) {
                 onStarted()
             }
 
             recordingJob = scope.launch {
                 val buffer = ByteArray(bufferSize)
+                Log.d(tag, "Thread de leitura contínua de PCM 16kHz iniciada com buffer de ${buffer.size} bytes.")
+
                 try {
-                    while (isActive && _isRecording.value && audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                        val bytesRead = record.read(buffer, 0, buffer.size)
+                    while (isActive && _isRecording.value) {
+                        val activeRecord = audioRecord ?: break
+                        if (activeRecord.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                            Log.w(tag, "AudioRecord saiu do estado de gravação nativo (recordingState=${activeRecord.recordingState}).")
+                            break
+                        }
+
+                        val bytesRead = activeRecord.read(buffer, 0, buffer.size)
+
                         if (bytesRead > 0) {
-                            onAudioChunk(buffer, bytesRead)
+                            // Repassa bytes PCM continuamente para o motor STT
+                            onAudioChunk(buffer.copyOf(bytesRead), bytesRead)
                         } else if (bytesRead < 0) {
-                            Log.w(tag, "Erro na leitura de fluxo do AudioRecord: $bytesRead")
+                            val errorDesc = when (bytesRead) {
+                                AudioRecord.ERROR_INVALID_OPERATION -> "ERROR_INVALID_OPERATION"
+                                AudioRecord.ERROR_BAD_VALUE -> "ERROR_BAD_VALUE"
+                                AudioRecord.ERROR_DEAD_OBJECT -> "ERROR_DEAD_OBJECT"
+                                AudioRecord.ERROR -> "ERROR"
+                                else -> "CÓDIGO_$bytesRead"
+                            }
+                            Log.e(tag, "Falha na leitura do AudioRecord: $errorDesc")
                             break
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e(tag, "Exceção durante captura de áudio", e)
+                    Log.e(tag, "Exceção crítica durante a leitura contínua da thread de áudio", e)
                 } finally {
+                    Log.d(tag, "Finalizando thread de captura de áudio.")
                     cleanUp()
                 }
             }
 
             true
         } catch (e: SecurityException) {
-            Log.e(tag, "Permissão RECORD_AUDIO não concedida para AudioRecord", e)
-            withContext(Dispatchers.Main) { onError("Permissão de microfone não concedida.") }
+            Log.e(tag, "Permissão RECORD_AUDIO não concedida para o AudioRecord", e)
+            withContext(Dispatchers.Main) { onError("Permissão de microfone negada.") }
+            cleanUp()
             false
         } catch (e: Exception) {
-            Log.e(tag, "Erro inesperado ao iniciar AudioRecord", e)
-            withContext(Dispatchers.Main) { onError("Erro na inicialização do microfone: ${e.localizedMessage}") }
+            Log.e(tag, "Erro inesperado ao configurar o AudioRecord", e)
+            withContext(Dispatchers.Main) { onError("Erro no hardware de áudio: ${e.localizedMessage}") }
+            cleanUp()
             false
         }
     }
 
     fun stop() {
+        Log.d(tag, "Solicitada parada do AudioRecorder.")
         _isRecording.value = false
         recordingJob?.cancel()
         recordingJob = null
@@ -134,7 +180,7 @@ class AudioRecorder(
                 record.release()
             }
         } catch (e: Exception) {
-            Log.w(tag, "Erro ao liberar recursos do AudioRecord", e)
+            Log.e(tag, "Erro ao liberar recursos do hardware AudioRecord", e)
         } finally {
             audioRecord = null
             _isRecording.value = false
