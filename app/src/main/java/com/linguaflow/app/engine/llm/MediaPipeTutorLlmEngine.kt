@@ -17,6 +17,11 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 
+/**
+ * Motor de inferência On-Device MediaPipe para o Tutor Linguaflow (Gemma 2B / Llama).
+ * Implementa a persona bilíngue Biconfident (Português + Inglês natural), limpeza rigorosa
+ * de resquícios de prompt/template e garantia de ciclo de vida singleton em memória.
+ */
 class MediaPipeTutorLlmEngine(
     private val context: Context,
     private val modelManager: ModelDownloadManager
@@ -55,7 +60,7 @@ class MediaPipeTutorLlmEngine(
 
     /**
      * Garante o carregamento do LlmInference uma única vez (thread-safe e singleton).
-     * Evita recriação a cada mensagem para não perder recursos e manter estabilidade.
+     * Evita recriação a cada mensagem para manter o contexto e economizar recursos.
      */
     override suspend fun loadModel(): Result<Unit> = withContext(Dispatchers.IO) {
         mutex.withLock {
@@ -67,7 +72,7 @@ class MediaPipeTutorLlmEngine(
             }
 
             val modelFile = findModelFile() ?: return@withContext Result.failure(
-                IllegalStateException("Arquivo do modelo Gemma não encontrado em filesDir/models")
+                IllegalStateException("Arquivo do modelo LLM não encontrado em filesDir/models")
             )
 
             isInitializing = true
@@ -110,18 +115,20 @@ class MediaPipeTutorLlmEngine(
             val inference = llmInference
             if (inference != null) {
                 try {
-                    val response = inference.generateResponse(fullPrompt)
-                    if (response.isNotBlank()) {
-                        return@withContext Result.success(response)
+                    val rawResponse = inference.generateResponse(fullPrompt)
+                    val cleaned = cleanModelOutput(rawResponse)
+                    if (cleaned.isNotBlank()) {
+                        return@withContext Result.success(cleaned)
                     }
                 } catch (e: Exception) {
                     Log.w(tag, "Erro na inferência nativa do MediaPipe, acionando fallback inteligente", e)
                 }
             }
 
-            // Fallback bilíngue contextual se o modelo de pesos ainda estiver ausente ou falhar
+            // Fallback bilíngue contextual e caloroso
             val simulated = generateIntelligentFallback(prompt, history, userLevel)
-            Result.success(simulated)
+            val cleanedFallback = cleanModelOutput(simulated)
+            Result.success(cleanedFallback)
         }
     }
 
@@ -147,8 +154,9 @@ class MediaPipeTutorLlmEngine(
                 fullResponse = ""
             }
 
-            if (fullResponse.isNotBlank()) {
-                val tokens = fullResponse.split(Regex("(?<=\\s|>)"))
+            val cleaned = cleanModelOutput(fullResponse)
+            if (cleaned.isNotBlank()) {
+                val tokens = cleaned.split(Regex("(?<=\\s|>)"))
                 val buffer = StringBuilder()
                 for (token in tokens) {
                     buffer.append(token)
@@ -159,9 +167,10 @@ class MediaPipeTutorLlmEngine(
             }
         }
 
-        // Streaming do fallback dinâmico contextual
+        // Streaming do fallback bilíngue contextual
         val simulated = generateIntelligentFallback(prompt, history, userLevel)
-        val tokens = simulated.split(Regex("(?<=\\s|>)"))
+        val cleanedFallback = cleanModelOutput(simulated)
+        val tokens = cleanedFallback.split(Regex("(?<=\\s|>)"))
         val buffer = StringBuilder()
         for (token in tokens) {
             buffer.append(token)
@@ -171,8 +180,46 @@ class MediaPipeTutorLlmEngine(
     }.flowOn(Dispatchers.IO)
 
     /**
-     * Injeção do System Prompt Bilíngue (Estilo Biconfident) e formatação
-     * completa do histórico de mensagens do usuário.
+     * Limpa de forma rigorosa e definitiva qualquer resquício de template de prompt,
+     * tags de turno e prefixos de papéis vazados pelo LLM.
+     */
+    fun cleanModelOutput(rawText: String): String {
+        var text = rawText.trim()
+        if (text.isBlank()) return ""
+
+        // 1. Remove marcadores de turno de controle
+        text = text
+            .replace(Regex("<start_of_turn>(user|model)?", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("<end_of_turn>", RegexOption.IGNORE_CASE), "")
+
+        // 2. Remove repetições de mensagens de template do sistema
+        text = text
+            .replace(Regex("(?i)Current Student Message:.*?(?:\n|$)"), "")
+            .replace(Regex("(?i)Conversation History:.*?(?:\n|$)"), "")
+            .replace(Regex("(?i)Student:.*?(?:\n|$)"), "")
+
+        // 3. Se houver conteúdo antes da primeira tag <reply>, descarta o lixo inicial
+        val replyIndex = text.indexOf("<reply>", ignoreCase = true)
+        if (replyIndex > 0) {
+            text = text.substring(replyIndex)
+        }
+
+        // 4. Remove prefixos de papéis soltos no início
+        text = text.replace(Regex("^(?:Tutor|Assistant|AI|Model|Student)\\s*:\\s*", RegexOption.IGNORE_CASE), "")
+
+        // 5. Remove wrappers de markdown desnecessários (```xml ou ```)
+        text = text
+            .replace(Regex("^```(?:xml)?", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("```$"), "")
+            .trim()
+
+        return text
+    }
+
+    /**
+     * Injeção do System Prompt Bilíngue Obrigatório (Estilo Biconfident).
+     * O tutor atua como uma pessoa real, empática, acolhedora e mistura
+     * o Português e o Inglês para ensinar com fluidez natural.
      */
     private fun buildTutorPrompt(
         userInput: String,
@@ -180,46 +227,43 @@ class MediaPipeTutorLlmEngine(
         userLevel: String,
         targetLanguage: String
     ): String {
-        // Histórico completo de conversas (sem truncar bruscamente)
-        val formattedHistory = history.joinToString("\n") { msg ->
+        val formattedHistory = history.takeLast(10).joinToString("\n") { msg ->
             if (msg.sender == "user") {
-                "<start_of_turn>user\nStudent: ${msg.content}<end_of_turn>"
+                "<start_of_turn>user\n${msg.content}<end_of_turn>"
             } else {
-                "<start_of_turn>model\nTutor: ${msg.content}<end_of_turn>"
+                val cleanAssistant = TutorResponseParser.cleanTemplateArtifacts(msg.content)
+                "<start_of_turn>model\n$cleanAssistant<end_of_turn>"
             }
         }
 
         return """
             <start_of_turn>user
-            You are Linguaflow AI, an empathetic, highly adaptive, and conversational bilingual English tutor (similar to an intelligent voice assistant like Bixby/Siri specialized in language education).
-            Target Language: $targetLanguage.
-            Student Level: $userLevel.
+            Você é o Tutor Linguaflow, uma pessoa real, amigável, empática e encorajadora que ajuda o usuário a praticar inglês.
+            Você é nativamente bilíngue e DEVE mesclar o Português e o Inglês de forma natural na mesma frase, exatamente como um falante bilíngue faz para ensinar no dia a dia (ex: 'Sem problema! Suco de fruta é muito comum, nós dizemos fruit juice. Repete comigo: fruit juice. Juice fruit não soa tão natural, sabe?').
 
-            BILINGUAL GUIDELINES (BICONFIDENT STYLE):
-            1. MIXED LANGUAGE COMPREHENSION: The student may freely speak Portuguese, English, or mix both in the same phrase (e.g. "Hello, bom dia, como eu digo...", "I went to the supermercado ontem"). Always comprehend their intention smoothly and naturally.
-            2. ADAPTIVE LANGUAGE RESPONSE:
-               - If the student speaks or asks questions in Portuguese, reply warmly in Portuguese with pedagogical explanations, translation, and practical English sentences.
-               - If the student speaks in English, reply in natural conversational English suited to level $userLevel and ask an engaging follow-up question.
-               - If the student mixes Portuguese and English, warmly acknowledge what they meant, teach the natural 100% English phrasing, and keep the dialog active.
-            3. MANDATORY 3 XML BLOCKS:
-               Output ONLY these 3 XML blocks without any markdown code wrappers:
-               <reply>Conversational answer (in Portuguese if user asked in PT, in English if user spoke in EN, or bilingual if mixed)</reply>
-               <fix>Original phrase -> Corrected phrase | Explicação didática em português (or OK if no mistakes)</fix>
-               <pron>Dica de pronúncia prática em português com fonética simples (or OK if not needed)</pron>
+            DIRETRIZES DE PERSONA E COMPORTAMENTO (BICONFIDENT STYLE):
+            1. Participe ativamente como uma pessoa real: use interjeições naturais ('ah', 'então', 'sabe', 'olha só') e tom acolhedor.
+            2. Correção de Pronúncia/Gramática: Nunca diga apenas 'Errado'. Explique de forma leve e amigável (ex: 'Quase lá! Ficaria mais natural se você falasse...').
+            3. Mesclagem pedagógica: Se o usuário falar em português ou misturar (ex: 'oi', 'bom dia', 'como fala...', 'olá', 'como se diz'), responda calorosamente em PORTUGUÊS mesclando expressões em inglês com contexto imediato e proponha uma prática engajadora.
+            4. Respostas curtas e conversacionais, otimizadas para simulação de bate-papo por voz.
+            5. Nível do estudante: $userLevel. Idioma-alvo: $targetLanguage.
+            6. SAÍDA OBRIGATÓRIA: Forneça APENAS os 3 blocos XML abaixo, sem nenhum texto introdutório e sem markdown:
+            <reply>Sua resposta conversacional bilíngue acolhedora</reply>
+            <fix>Dica didática de gramática ou vocabulário em português (ou OK)</fix>
+            <pron>Dica prática de pronúncia com fonética simples em português (ou OK)</pron>
 
-            Conversation History:
+            Histórico de Conversa:
             $formattedHistory
 
-            Current Student Message: $userInput
+            Mensagem Atual do Estudante: $userInput
             <end_of_turn>
             <start_of_turn>model
-            Tutor:
         """.trimIndent()
     }
 
     /**
-     * Fallback contextual dinâmico que analisa o histórico completo e a intenção
-     * da mensagem atual, evitando respostas estáticas ou apenas em inglês.
+     * Fallback contextual dinâmico que analisa a intenção do estudante
+     * e garante respostas no estilo Biconfident, eliminando respostas secas ou monolíngues.
      */
     private fun generateIntelligentFallback(
         input: String,
@@ -233,92 +277,91 @@ class MediaPipeTutorLlmEngine(
         val fix: String
         val pron: String
 
-        // Detecção de língua e intenção
-        val isAskingInPortuguese = lower.contains("como se diz") ||
+        val isAskingHowToSay = lower.contains("como se diz") ||
             lower.contains("como eu digo") ||
             lower.contains("como falo") ||
+            lower.contains("como fala") ||
+            lower.contains("como dizer") ||
             lower.contains("o que significa") ||
             lower.contains("qual o significado") ||
-            lower.contains("ajuda") ||
             lower.contains("como usar") ||
             lower.startsWith("como ") ||
             lower.startsWith("o que ") ||
-            lower.startsWith("por que ") ||
             lower.startsWith("qual ")
 
+        val hasPortugueseGreeting = listOf("oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "e aí", "e ai", "tudo bem").any {
+            lower == it || lower.startsWith("$it ") || lower.contains(" $it")
+        }
+
+        val hasEnglishGreeting = listOf("hello", "hi", "hey", "good morning", "good afternoon", "good evening").any {
+            lower == it || lower.startsWith("$it ") || lower.contains(" $it")
+        }
+
         val hasPortugueseWords = lower.any { it in "ãõáéíóúçêô" } ||
-            listOf("bom dia", "boa tarde", "boa noite", "olá", "oi", "obrigado", "valeu", "por favor", "meu nome", "quero", "tenho", "anos", "trabalho", "estudo").any { lower.contains(it) }
+            listOf("você", "obrigado", "valeu", "por favor", "meu nome", "quero", "tenho", "anos", "trabalho", "estudo", "gosto", "ajuda", "entendi").any { lower.contains(it) }
 
-        val hasEnglishWords = listOf("hello", "hi", "good morning", "good evening", "how are", "my name", "i am", "i want", "i have", "because", "what", "like").any { lower.contains(it) }
-
-        val isMixed = (isAskingInPortuguese || hasPortugueseWords) && hasEnglishWords
+        val hasEnglishWords = listOf("how are you", "my name is", "i am", "i want", "i have", "because", "what", "like", "english", "practice").any { lower.contains(it) }
 
         when {
-            // Caso 1: Pergunta sobre tradução / significado em português
-            isAskingInPortuguese -> {
+            // Caso 1: Saudações em português ou mistas ("oi", "olá", "bom dia", etc.)
+            hasPortugueseGreeting -> {
+                reply = "Oi! Que alegria ter você aqui para praticar inglês hoje! How are you doing today? Como está sendo seu dia? Podemos falar sobre sua rotina, hobbies ou qualquer dúvida que você tiver!"
+                fix = "'Oi' em inglês pode ser 'Hello' (perfeito para qualquer situação) ou 'Hi' (bem casual e descontraído)."
+                pron = "Ao falar 'How are you', ligue os sons suavemente: /haʊ-ɑːr-juː/ sem pausas secas."
+            }
+
+            // Caso 2: Pergunta de tradução ou vocabulário ("como fala...", "como se diz...")
+            isAskingHowToSay -> {
                 val queryTerm = trimmed
-                    .replace(Regex("(?i)^(como se diz|como eu digo|como falo|o que significa|qual o significado de)\\s*"), "")
+                    .replace(Regex("(?i)^(como se diz|como eu digo|como falo|como fala|como dizer|o que significa|qual o significado de)\\s*"), "")
                     .trim('?', ' ', '.', ':', '"', '\'')
 
                 val cleanQuery = if (queryTerm.isNotBlank()) queryTerm else "essa ideia"
-                reply = "Para dizer \"$cleanQuery\" em inglês, você pode usar: \"How do I say this?\" ou a expressão correspondente dependendo da situação. Gostaria de tentar formular uma frase completa praticando essa expressão?"
-                fix = "\"$cleanQuery\" -> Expressão equivalente em inglês | Em inglês natural, o contexto ajuda a escolher entre palavras formais e do dia a dia."
-                pron = "Pratique a entonação: conecte as palavras suavemente sem pausas secas (ex: 'How-do-I' soa como uma palavra única)."
+                reply = "Ah, excelente pergunta! Para dizer \"$cleanQuery\" em inglês, você pode falar: \"How do I say this?\". Olha só um exemplo prático: \"I would love to learn more about this!\". Repete comigo para fixar!"
+                fix = "\"$cleanQuery\" -> Expressão equivalente em inglês | No dia a dia, conectar o termo a uma frase completa acelera a memorização."
+                pron = "Dica de ritmo: conecte as palavras no estilo 'connected speech', unindo consoantes finais com vogais iniciais."
             }
 
-            // Caso 2: Fala mista (Português + Inglês na mesma frase)
-            isMixed -> {
-                reply = "Compreendi perfeitamente o que você quis dizer! Essa mistura é um estágio muito natural no aprendizado bilíngue. Em inglês do dia a dia, podemos dizer: \"Hello! How can I practice this effectively today?\". Que tal tentar repetir essa frase completa em inglês?"
-                fix = "Expressão mista (PT + EN) -> Frase 100% em inglês | Experimente aos poucos substituir os termos em português pelos equivalentes em inglês."
-                pron = "Dica para fala mista: ao falar em inglês, mantenha o ritmo rítmico 'stress-timed', enfatizando as palavras com significado principal."
+            // Caso 3: Mistura de Português e Inglês na mesma frase (Code-Switching)
+            (hasPortugueseWords || hasPortugueseGreeting) && hasEnglishWords -> {
+                reply = "Compreendi perfeitamente o que você quis dizer! Olha só, essa mescla entre português e inglês é super natural quando estamos aprendendo. Em inglês fluído do dia a dia, podemos falar: \"Hello! How can I practice this effectively today?\". Que tal tentar repetir essa frase completa comigo?"
+                fix = "Expressão mista (PT + EN) -> Frase 100% em inglês | Aos poucos, você vai ganhando confiança para usar a frase inteira em inglês!"
+                pron = "Lembre-se da entonação rítmica do inglês: dê mais ênfase nas palavras de conteúdo ('practice', 'effectively') e menos nas de ligação."
             }
 
-            // Caso 3: Saudações
-            lower.contains("hello") || lower.contains("hi") || lower.contains("olá") || lower.contains("oi") -> {
-                if (hasPortugueseWords) {
-                    reply = "Olá! Que ótimo ter você aqui praticando hoje. Como está sendo o seu dia? Podemos conversar sobre sua rotina, hobbies ou tirar dúvidas de gramática em inglês!"
-                    fix = "\"Oi / Olá\" -> \"Hello / Hi\" | 'Hello' é perfeito para qualquer contexto e 'Hi' para conversas informais."
-                    pron = "Em 'hello', o 'h' inicial é pronunciado como um suspiro de ar suave (/h/ aspirado)."
-                } else {
-                    reply = "Hello there! It is wonderful to chat with you today. How is everything going with your day so far?"
-                    fix = "OK"
-                    pron = "In 'hello', emphasize the second syllable: he-LLO."
-                }
+            // Caso 4: Saudação puramente em inglês ("hello", "hi", "good morning")
+            hasEnglishGreeting && !hasPortugueseWords -> {
+                reply = "Hello there! It is wonderful to chat with you today! How is your day going so far? Tell me, what did you do this morning?"
+                fix = "OK"
+                pron = "In 'hello', emphasize the second syllable naturally: he-LLO."
             }
 
-            // Caso 4: Apresentação pessoal
+            // Caso 5: Apresentação pessoal ("my name is..." / "meu nome é...")
             lower.contains("name is") || lower.contains("meu nome") -> {
-                reply = "It is great to meet you! Introducing yourself is the first step to confident conversations. Where are you currently based?"
-                fix = if (lower.contains("meu nome")) "\"Meu nome é...\" -> \"My name is...\" | Estrutura correta de apresentação em inglês." else "OK"
-                pron = "Na palavra 'name', a letra 'a' tem som do ditongo /eɪ/ (como 'neim')."
+                reply = "Prazer em conhecer você! It is wonderful to meet you! Apresentar-se com confiança é o primeiro passo para grandes conversas. What do you like to do in your free time?"
+                fix = if (lower.contains("meu nome")) "\"Meu nome é...\" -> \"My name is...\" | Estrutura clássica de apresentação em inglês." else "OK"
+                pron = "Na palavra 'name', o 'a' tem som do ditongo /eɪ/ (como 'neim')."
             }
 
-            // Caso 5: Idade ("I have ... years")
+            // Caso 6: Idade com 'have' ("I have 25 years")
             lower.contains("i have") && (lower.contains("year") || lower.contains("ano")) -> {
-                reply = "Entendi perfeitamente! Falar de idade é muito comum. Em inglês, usamos o verbo 'to be' (I am) em vez de 'to have' para dizer a idade."
-                fix = "\"I have ... years\" -> \"I am ... years old\" | Em inglês nós 'somos' a idade (I am 25 years old), não 'temos'."
-                pron = "Em 'years', comece com o som semivogal suave /j/ ('iírs'), evitando som de 'j' do português."
+                reply = "Entendi perfeitamente! Falar de idade é muito comum. Olha só: em inglês, nós não 'temos' a idade com 'have', nós 'somos' a idade usando o verbo 'to be'. Por exemplo: \"I am 25 years old\". Repete comigo: \"I am...\"!"
+                fix = "\"I have ... years\" -> \"I am ... years old\" | Em inglês, usamos o verbo 'to be' para expressar idade."
+                pron = "Na palavra 'years', o som inicial é um /j/ suave ('iírs'), diferente do 'j' forte do português."
             }
 
-            // Caso 6: Dúvidas sobre rotina
-            lower.contains("routine") || lower.contains("rotina") || lower.contains("wake up") || lower.contains("work") -> {
-                reply = "Talking about daily routines is great for practicing the Simple Present tense! What time do you usually wake up in the morning?"
-                fix = "OK"
-                pron = "Na palavra 'routine', a tonicidade fica na segunda sílaba: ru-TEEN."
-            }
-
-            // Caso 7: Apenas em português sem inglês
+            // Caso 7: Mensagem apenas em português
             hasPortugueseWords && !hasEnglishWords -> {
-                reply = "Entendi sua mensagem! Como seu tutor de inglês, vou te guiar passo a passo. Vamos tentar colocar essa ideia em inglês juntos? Experimente responder a esta pergunta em inglês: \"What do you enjoy doing in your free time?\""
-                fix = "Pratique estruturar frases em inglês usando a ordem: Sujeito + Verbo + Complemento."
-                pron = "Dica: Em inglês, lembre-se de pronunciar o 'I' (eu) com som aberto /aɪ/ (como 'ai')."
+                reply = "Entendi perfeitamente! Como seu tutor de inglês, estou aqui para te guiar passo a passo com calma. Vamos transformar essa ideia para o inglês juntos? Tenta responder para mim: \"What is your favorite hobby?\""
+                fix = "Dica: Para construir frases em inglês, siga a ordem direta: Sujeito + Verbo + Objeto (ex: I like music)."
+                pron = "Em inglês, lembre-se de pronunciar o 'I' (eu) com o som aberto /aɪ/ (como 'ai')."
             }
 
-            // Caso 8: Entrada em inglês padrão
+            // Caso 8: Entrada padrão em inglês
             else -> {
-                reply = "That is very interesting! You are doing great expressing your thoughts in English. Could you tell me a little bit more about that?"
+                reply = "That sounds really interesting! You are expressing yourself very well. Could you tell me a little bit more about that?"
                 fix = "OK"
-                pron = "Remember to link consonant endings to starting vowels for a fluid, natural cadence."
+                pron = "Keep your sentences flowing by linking the ending consonant of one word to the beginning vowel of the next."
             }
         }
 

@@ -21,6 +21,11 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
+/**
+ * ViewModel central da tela de conversação com o Tutor IA bilíngue.
+ * Gerencia a máquina de estados (IDLE, LISTENING, TRANSCRIBING, THINKING, SPEAKING),
+ * adição imediata de mensagens na UI, parser de feedback didático e reprodução nativa TTS.
+ */
 class TutorChatViewModel(
     private val repository: LinguaflowRepository,
     val tutorLlm: TutorLlmEngine,
@@ -78,6 +83,10 @@ class TutorChatViewModel(
                             _uiState.value = ChatUiState.IDLE
                         }
                     }
+                    is SttState.Error -> {
+                        _errorMessage.value = state.message
+                        _uiState.value = ChatUiState.IDLE
+                    }
                     else -> {}
                 }
             }
@@ -94,7 +103,7 @@ class TutorChatViewModel(
                 Log.d(tag, "Iniciando carregamento prévio do LlmInference no ViewModel...")
                 tutorLlm.loadModel()
             } catch (e: Exception) {
-                Log.w(tag, "Aviso ao carregar LLM no ViewModel (fallback ativo): ${e.message}")
+                Log.w(tag, "Aviso ao carregar LLM no ViewModel (fallback bilíngue ativo): ${e.message}")
             }
         }
     }
@@ -112,38 +121,48 @@ class TutorChatViewModel(
         _errorMessage.value = null
     }
 
+    /**
+     * Envia mensagem do usuário, persiste imediatamente no repositório/UI,
+     * executa inferência do tutor com limpeza de template e dispara o TTS nativo.
+     */
     fun sendMessage(textToSend: String) {
         val trimmed = textToSend.trim()
         if (trimmed.isBlank() || _uiState.value != ChatUiState.IDLE) return
 
+        // 1. Limpa caixa de texto e define estado para THINKING
         _inputText.value = ""
         _uiState.value = ChatUiState.THINKING
         _streamingRawText.value = ""
 
         viewModelScope.launch {
             try {
-                // Salva mensagem do usuário
+                // 2. Adiciona a mensagem do usuário imediatamente ao Room/UI
                 repository.sendMessage(trimmed, 1L)
 
                 val fullOutput = StringBuilder()
                 val currentHistory = messages.value
 
-                // Streaming da resposta do tutor com prompt bilíngue e histórico completo
+                // 3. Streaming da resposta do tutor com prompt bilíngue e histórico completo
                 tutorLlm.generateTutorReplyStream(
                     prompt = trimmed,
                     history = currentHistory,
                     userLevel = "A1",
                     targetLanguage = "Inglês"
                 ).collect { chunk ->
-                    _streamingRawText.value = chunk
+                    // Limpa resquícios antes de repassar ao estado de streaming visual
+                    val cleanChunk = TutorResponseParser.cleanTemplateArtifacts(chunk)
+                    _streamingRawText.value = cleanChunk
                     fullOutput.clear().append(chunk)
                 }
 
-                // Parser dos 3 blocos obrigatórios (<reply>, <fix>, <pron>)
+                // 4. Parser rigoroso dos 3 blocos (<reply>, <fix>, <pron>) com limpeza de tags
                 val finalFeedback: TutorFeedback = TutorResponseParser.parse(fullOutput.toString())
+                val cleanReply = finalFeedback.reply.ifBlank {
+                    "Que ótimo! Vamos continuar praticando. Let's keep talking!"
+                }
 
                 val storedMetadata = buildString {
-                    append("<reply>${finalFeedback.reply}</reply>")
+                    append("<reply>$cleanReply</reply>")
                     if (finalFeedback.hasCorrections) {
                         append("<fix>${finalFeedback.corrections}</fix>")
                     }
@@ -152,8 +171,9 @@ class TutorChatViewModel(
                     }
                 }
 
+                // 5. Salva a mensagem do tutor limpa no banco de dados
                 val newMsgId = repository.saveAssistantMessage(
-                    content = finalFeedback.reply.ifBlank { "That sounds great! Keep practicing." },
+                    content = cleanReply,
                     conversationId = 1L,
                     translation = storedMetadata
                 )
@@ -161,9 +181,9 @@ class TutorChatViewModel(
                 _streamingRawText.value = ""
                 _uiState.value = ChatUiState.SPEAKING
 
-                // Reprodução automática fluida do TTS da resposta do tutor
+                // 6. Aciona o TextToSpeech (TTS) nativo instantaneamente com o texto limpo gerado
                 ttsEngine.speak(
-                    text = finalFeedback.reply,
+                    text = cleanReply,
                     utteranceId = newMsgId.toString(),
                     onDone = {
                         _uiState.value = ChatUiState.IDLE
@@ -173,11 +193,15 @@ class TutorChatViewModel(
             } catch (e: Exception) {
                 Log.e(tag, "Erro no processamento da mensagem do tutor", e)
                 _errorMessage.value = "Erro ao processar resposta: ${e.localizedMessage}"
+                _streamingRawText.value = ""
                 _uiState.value = ChatUiState.IDLE
             }
         }
     }
 
+    /**
+     * Inicia a escuta do microfone com verificação de eco e callbacks para atualização da UI.
+     */
     fun startListening(onError: (String) -> Unit = {}) {
         if (_uiState.value == ChatUiState.SPEAKING) {
             onError("O microfone está desativado enquanto o tutor fala para evitar eco.")
@@ -192,10 +216,12 @@ class TutorChatViewModel(
                 _inputText.value = text
                 if (text.isNotBlank()) {
                     sendMessage(text)
+                } else if (_uiState.value == ChatUiState.LISTENING || _uiState.value == ChatUiState.TRANSCRIBING) {
+                    _uiState.value = ChatUiState.IDLE
                 }
             },
             onError = { err ->
-                Log.e(tag, "Erro no STT: $err")
+                Log.e(tag, "Erro no motor STT: $err")
                 _errorMessage.value = err
                 _uiState.value = ChatUiState.IDLE
                 onError(err)
@@ -203,6 +229,9 @@ class TutorChatViewModel(
         )
     }
 
+    /**
+     * Interrompe a escuta do microfone e restabelece o estado IDLE se necessário.
+     */
     fun stopListening() {
         sttEngine.stopListening()
         if (_uiState.value == ChatUiState.LISTENING || _uiState.value == ChatUiState.TRANSCRIBING) {
@@ -216,7 +245,9 @@ class TutorChatViewModel(
         if (currentPlayback is TtsPlaybackState.Speaking && currentPlayback.utteranceId == id) {
             ttsEngine.stop()
         } else {
-            ttsEngine.speak(message.content, utteranceId = id)
+            // Garante que o texto enviado ao TTS não contenha tags XML
+            val cleanSpeech = TutorResponseParser.cleanTemplateArtifacts(message.content)
+            ttsEngine.speak(cleanSpeech, utteranceId = id)
         }
     }
 

@@ -174,6 +174,12 @@ class VoskSpeechToTextEngine(
                             Log.e(tag, "Falha no AudioRecord nativo: $err")
                             _state.value = SttState.Error(err)
                             onErrorCallback?.invoke(err)
+                        },
+                        onSilenceDetected = {
+                            Log.d(tag, "Silêncio detectado pelo AudioRecorder. Finalizando escuta e emitindo texto.")
+                            scope.launch(Dispatchers.Main) {
+                                stopListening()
+                            }
                         }
                     )
 

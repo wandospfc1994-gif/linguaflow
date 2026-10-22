@@ -8,8 +8,21 @@ object TutorResponseParser {
     private val fixRegex = Regex("<fix>(.*?)(?:</fix>|$)", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
     private val pronRegex = Regex("<pron>(.*?)(?:</pron>|$)", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
 
+    /**
+     * Remove vazamento de tags de controle do modelo e de templates de prompt.
+     */
+    fun cleanTemplateArtifacts(text: String): String {
+        return text
+            .replace(Regex("<start_of_turn>(user|model)?", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("<end_of_turn>", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("(?i)Current Student Message:.*?(?:\n|$)"), "")
+            .replace(Regex("(?i)Conversation History:.*?(?:\n|$)"), "")
+            .replace(Regex("(?i)^(?:Tutor|Assistant|AI|Model|Student)\\s*:\\s*"), "")
+            .trim()
+    }
+
     fun parse(rawText: String): TutorFeedback {
-        val trimmed = rawText.trim()
+        val trimmed = cleanTemplateArtifacts(rawText)
         if (trimmed.isEmpty()) {
             return TutorFeedback(reply = "", rawOutput = "")
         }
@@ -19,7 +32,7 @@ object TutorResponseParser {
             trimmed.contains("<pron>", ignoreCase = true)
 
         if (!hasAnyTags) {
-            // Fallback for untagged model outputs
+            // Fallback para modelos que não geraram tags XML
             return parseUntagged(trimmed)
         }
 
@@ -27,7 +40,7 @@ object TutorResponseParser {
         var fixContent = fixRegex.find(trimmed)?.groupValues?.get(1)?.trim()
         var pronContent = pronRegex.find(trimmed)?.groupValues?.get(1)?.trim()
 
-        // Clean up remaining tags if unclosed tags overlapped
+        // Remove tags caso tenha ocorrido vazamento dentro dos blocos
         if (replyContent.contains("<fix>", ignoreCase = true)) {
             replyContent = replyContent.substringBefore("<fix>").trim()
         }
@@ -35,20 +48,23 @@ object TutorResponseParser {
             fixContent = fixContent.substringBefore("<pron>").trim()
         }
 
+        // Limpeza profunda de resquícios de template no conteúdo do reply
+        replyContent = cleanTemplateArtifacts(replyContent)
+
         val normalizedFix = if (fixContent.isNullOrBlank() || fixContent.equals("OK", ignoreCase = true) || fixContent.equals("N/A", ignoreCase = true)) {
             null
         } else {
-            fixContent
+            cleanTemplateArtifacts(fixContent)
         }
 
         val normalizedPron = if (pronContent.isNullOrBlank() || pronContent.equals("OK", ignoreCase = true) || pronContent.equals("N/A", ignoreCase = true)) {
             null
         } else {
-            pronContent
+            cleanTemplateArtifacts(pronContent)
         }
 
         return TutorFeedback(
-            reply = replyContent.ifBlank { trimmed.substringBefore("<").trim() },
+            reply = replyContent.ifBlank { cleanTemplateArtifacts(trimmed.substringBefore("<").trim()) },
             corrections = normalizedFix,
             pronunciationTip = normalizedPron,
             rawOutput = rawText
@@ -62,7 +78,8 @@ object TutorResponseParser {
             .takeIf { it != -1 } ?: text.indexOf("Pronúncia:", ignoreCase = true).takeIf { it != -1 }
 
         if (fixIndex == null && pronIndex == null) {
-            return TutorFeedback(reply = text, rawOutput = text)
+            val cleanOnly = cleanTemplateArtifacts(text)
+            return TutorFeedback(reply = cleanOnly, rawOutput = text)
         }
 
         val reply = if (fixIndex != null && (pronIndex == null || fixIndex < pronIndex)) {
@@ -84,9 +101,9 @@ object TutorResponseParser {
         } else null
 
         return TutorFeedback(
-            reply = reply,
-            corrections = fix?.takeIf { !it.equals("OK", ignoreCase = true) },
-            pronunciationTip = pron?.takeIf { !it.equals("OK", ignoreCase = true) },
+            reply = cleanTemplateArtifacts(reply),
+            corrections = fix?.takeIf { !it.equals("OK", ignoreCase = true) }?.let { cleanTemplateArtifacts(it) },
+            pronunciationTip = pron?.takeIf { !it.equals("OK", ignoreCase = true) }?.let { cleanTemplateArtifacts(it) },
             rawOutput = text
         )
     }
