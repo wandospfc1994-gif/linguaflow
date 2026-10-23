@@ -34,6 +34,10 @@ class SherpaWhisperSpeechToTextEngine(
 
     private val tag = "SherpaWhisperStt"
 
+    private companion object {
+        const val REAL_TRANSCRIPTION_IMPLEMENTED = false
+    }
+
     private val _state = MutableStateFlow<SttState>(SttState.Idle)
     override val state: StateFlow<SttState> = _state.asStateFlow()
 
@@ -52,6 +56,11 @@ class SherpaWhisperSpeechToTextEngine(
     }
 
     fun isWhisperModelAvailable(): Boolean {
+        // STUB: a transcrição real com sherpa-onnx ainda não está implementada neste motor
+        // (não há dependência sherpa-onnx no build.gradle.kts). Enquanto isso, nunca anuncia
+        // disponibilidade, para o app não usar a "transcrição" fixa de demonstração.
+        if (!REAL_TRANSCRIPTION_IMPLEMENTED) return false
+
         val modelsDir = File(context.filesDir, "models")
         if (!modelsDir.exists()) return false
 

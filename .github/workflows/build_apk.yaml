@@ -50,8 +50,11 @@ jobs:
             base64 -d debug.keystore.base64 > debug.keystore
             echo "debug.keystore restaurada a partir de debug.keystore.base64."
           elif [ ! -f "debug.keystore" ]; then
-            keytool -genkeypair -v -keystore debug.keystore -alias androiddebugkey -keypass android -storepass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
-            echo "debug.keystore gerada com keytool."
+            # NÃO gerar uma chave nova aqui: cada build sairia com assinatura diferente e o Android
+            # recusaria a atualização por cima do app instalado (obrigando a desinstalar e apagando
+            # os modelos baixados em filesDir/models).
+            echo "ERRO: debug.keystore.base64 ausente no repositório. Sem uma chave fixa, o APK não atualiza por cima do anterior." >&2
+            exit 1
           fi
 
           # Restaurar release.keystore se fornecida

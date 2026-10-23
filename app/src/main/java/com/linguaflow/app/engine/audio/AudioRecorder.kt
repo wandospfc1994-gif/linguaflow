@@ -28,6 +28,11 @@ class AudioRecorder(
 ) {
     private val tag = "AudioRecorder"
 
+    private companion object {
+        const val SPEECH_RMS_THRESHOLD = 600.0
+        const val SILENCE_TIMEOUT_MS = 1800L
+    }
+
     private var audioRecord: AudioRecord? = null
     private var recordingJob: Job? = null
 
@@ -116,6 +121,12 @@ class AudioRecorder(
                 val buffer = ByteArray(bufferSize)
                 Log.d(tag, "Loop de leitura PCM 16kHz iniciado.")
 
+                // Detecção simples de silêncio (VAD por energia): depois que o usuário falou,
+                // ~1,8 s de silêncio dispara onSilenceDetected uma única vez.
+                var heardSpeech = false
+                var silenceStartMs = 0L
+                var silenceFired = false
+
                 try {
                     while (isActive && _isRecording.value) {
                         val active = audioRecord ?: break
@@ -124,6 +135,21 @@ class AudioRecorder(
                         if (read > 0) {
                             totalBytesRecorded += read
                             onAudioChunk(buffer.copyOf(read), read)
+
+                            if (!silenceFired) {
+                                val now = System.currentTimeMillis()
+                                if (rms(buffer, read) >= SPEECH_RMS_THRESHOLD) {
+                                    heardSpeech = true
+                                    silenceStartMs = 0L
+                                } else if (heardSpeech) {
+                                    if (silenceStartMs == 0L) {
+                                        silenceStartMs = now
+                                    } else if (now - silenceStartMs >= SILENCE_TIMEOUT_MS) {
+                                        silenceFired = true
+                                        onSilenceDetected()
+                                    }
+                                }
+                            }
                         } else if (read < 0) {
                             Log.w(tag, "Leitura do AudioRecord retornou código de erro: $read")
                             break
@@ -159,6 +185,20 @@ class AudioRecorder(
         recordingJob?.cancel()
         recordingJob = null
         cleanUp()
+    }
+
+    /** Energia RMS de um bloco PCM 16-bit little-endian. */
+    private fun rms(buf: ByteArray, bytes: Int): Double {
+        val samples = bytes / 2
+        if (samples == 0) return 0.0
+        var sum = 0.0
+        var i = 0
+        while (i + 1 < bytes) {
+            val sample = ((buf[i + 1].toInt() shl 8) or (buf[i].toInt() and 0xFF)).toShort().toInt()
+            sum += sample.toDouble() * sample
+            i += 2
+        }
+        return Math.sqrt(sum / samples)
     }
 
     private fun cleanUp() {

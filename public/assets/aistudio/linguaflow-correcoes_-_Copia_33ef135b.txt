@@ -1,0 +1,1231 @@
+diff --git a/.github/workflows/build_apk.yaml b/.github/workflows/build_apk.yaml
+index faf4165..0fbc32b 100644
+--- a/.github/workflows/build_apk.yaml
++++ b/.github/workflows/build_apk.yaml
+@@ -50,8 +50,11 @@ jobs:
+             base64 -d debug.keystore.base64 > debug.keystore
+             echo "debug.keystore restaurada a partir de debug.keystore.base64."
+           elif [ ! -f "debug.keystore" ]; then
+-            keytool -genkeypair -v -keystore debug.keystore -alias androiddebugkey -keypass android -storepass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+-            echo "debug.keystore gerada com keytool."
++            # NÃO gerar uma chave nova aqui: cada build sairia com assinatura diferente e o Android
++            # recusaria a atualização por cima do app instalado (obrigando a desinstalar e apagando
++            # os modelos baixados em filesDir/models).
++            echo "ERRO: debug.keystore.base64 ausente no repositório. Sem uma chave fixa, o APK não atualiza por cima do anterior." >&2
++            exit 1
+           fi
+ 
+           # Restaurar release.keystore se fornecida
+diff --git a/app/src/main/java/com/linguaflow/app/data/download/ModelDownloadManager.kt b/app/src/main/java/com/linguaflow/app/data/download/ModelDownloadManager.kt
+index 9f495db..9a78bc8 100644
+--- a/app/src/main/java/com/linguaflow/app/data/download/ModelDownloadManager.kt
++++ b/app/src/main/java/com/linguaflow/app/data/download/ModelDownloadManager.kt
+@@ -470,6 +470,19 @@ class ModelDownloadManager(
+                     }
+                 }
+ 
++                // Só confia no tamanho quando o servidor informou Content-Length. Se o download
++                // terminou antes do esperado, falha para o laço de retry retomar via Range,
++                // em vez de aceitar um arquivo truncado (que depois não carrega no MediaPipe).
++                val declaredLength = responseBody.contentLength()
++                if (declaredLength > 0) {
++                    val expectedTotal = if (isPartial) existingBytes + declaredLength else declaredLength
++                    if (partFile.length() != expectedTotal) {
++                        throw java.io.IOException(
++                            "Download incompleto: ${partFile.length()} de $expectedTotal bytes"
++                        )
++                    }
++                }
++
+                 isCompleted = true
+ 
+             } catch (e: CancellationException) {
+diff --git a/app/src/main/java/com/linguaflow/app/engine/audio/AudioRecorder.kt b/app/src/main/java/com/linguaflow/app/engine/audio/AudioRecorder.kt
+index 8a2db43..5052a50 100644
+--- a/app/src/main/java/com/linguaflow/app/engine/audio/AudioRecorder.kt
++++ b/app/src/main/java/com/linguaflow/app/engine/audio/AudioRecorder.kt
+@@ -28,6 +28,11 @@ class AudioRecorder(
+ ) {
+     private val tag = "AudioRecorder"
+ 
++    private companion object {
++        const val SPEECH_RMS_THRESHOLD = 600.0
++        const val SILENCE_TIMEOUT_MS = 1800L
++    }
++
+     private var audioRecord: AudioRecord? = null
+     private var recordingJob: Job? = null
+ 
+@@ -116,6 +121,12 @@ class AudioRecorder(
+                 val buffer = ByteArray(bufferSize)
+                 Log.d(tag, "Loop de leitura PCM 16kHz iniciado.")
+ 
++                // Detecção simples de silêncio (VAD por energia): depois que o usuário falou,
++                // ~1,8 s de silêncio dispara onSilenceDetected uma única vez.
++                var heardSpeech = false
++                var silenceStartMs = 0L
++                var silenceFired = false
++
+                 try {
+                     while (isActive && _isRecording.value) {
+                         val active = audioRecord ?: break
+@@ -124,6 +135,21 @@ class AudioRecorder(
+                         if (read > 0) {
+                             totalBytesRecorded += read
+                             onAudioChunk(buffer.copyOf(read), read)
++
++                            if (!silenceFired) {
++                                val now = System.currentTimeMillis()
++                                if (rms(buffer, read) >= SPEECH_RMS_THRESHOLD) {
++                                    heardSpeech = true
++                                    silenceStartMs = 0L
++                                } else if (heardSpeech) {
++                                    if (silenceStartMs == 0L) {
++                                        silenceStartMs = now
++                                    } else if (now - silenceStartMs >= SILENCE_TIMEOUT_MS) {
++                                        silenceFired = true
++                                        onSilenceDetected()
++                                    }
++                                }
++                            }
+                         } else if (read < 0) {
+                             Log.w(tag, "Leitura do AudioRecord retornou código de erro: $read")
+                             break
+@@ -161,6 +187,20 @@ class AudioRecorder(
+         cleanUp()
+     }
+ 
++    /** Energia RMS de um bloco PCM 16-bit little-endian. */
++    private fun rms(buf: ByteArray, bytes: Int): Double {
++        val samples = bytes / 2
++        if (samples == 0) return 0.0
++        var sum = 0.0
++        var i = 0
++        while (i + 1 < bytes) {
++            val sample = ((buf[i + 1].toInt() shl 8) or (buf[i].toInt() and 0xFF)).toShort().toInt()
++            sum += sample.toDouble() * sample
++            i += 2
++        }
++        return Math.sqrt(sum / samples)
++    }
++
+     private fun cleanUp() {
+         try {
+             audioRecord?.let { record ->
+diff --git a/app/src/main/java/com/linguaflow/app/engine/llm/MediaPipeTutorLlmEngine.kt b/app/src/main/java/com/linguaflow/app/engine/llm/MediaPipeTutorLlmEngine.kt
+index 107f94a..ee17ce2 100644
+--- a/app/src/main/java/com/linguaflow/app/engine/llm/MediaPipeTutorLlmEngine.kt
++++ b/app/src/main/java/com/linguaflow/app/engine/llm/MediaPipeTutorLlmEngine.kt
+@@ -18,9 +18,15 @@ import kotlinx.coroutines.withContext
+ import java.io.File
+ 
+ /**
+- * Motor de inferência On-Device MediaPipe para o Tutor Linguaflow (Gemma 2B / Llama).
+- * Utiliza um System Prompt limpo e direto sem metatextos ou instruções complexas que vazem
+- * no texto gerado, retornando estritamente a conversa natural do tutor bilíngue.
++ * Motor de inferência on-device (MediaPipe LLM Inference) para o tutor bilíngue.
++ *
++ * Princípios desta versão:
++ *  - O prompt segue o template de chat do Gemma (<start_of_turn>user/model) e INCLUI o histórico,
++ *    para o tutor lembrar da conversa.
++ *  - As instruções ficam no primeiro turno do usuário, escritas como regras (sem frases-modelo
++ *    entre colchetes ou aspas que o modelo pequeno possa copiar literalmente).
++ *  - Se o modelo não carregar ou a inferência falhar, o erro é PROPAGADO (a UI mostra o motivo).
++ *    Nada de respostas enlatadas fingindo ser a IA — isso escondia o problema real.
+  */
+ class MediaPipeTutorLlmEngine(
+     private val context: Context,
+@@ -30,75 +36,97 @@ class MediaPipeTutorLlmEngine(
+     private val tag = "MediaPipeTutorLlm"
+     private val mutex = Mutex()
+ 
+-    // Instância única em memória (Singleton/Scoped) do motor de inferência
+     private var llmInference: LlmInference? = null
+-    private var isInitializing = false
++
++    /** Último motivo de falha ao carregar o modelo (mostrado ao usuário em vez de resposta falsa). */
++    @Volatile
++    var lastLoadError: String? = null
++        private set
+ 
+     override val isModelLoaded: Boolean
+         get() = llmInference != null
+ 
+     private fun findModelFile(): File? {
+-        val modelInfo = ModelCatalog.LLM_GEMMA_2B
+-        val specificFile = modelManager.getModelFile(modelInfo)
+-        if (specificFile.exists() && specificFile.length() > 10_000_000L) {
++        val specificFile = modelManager.getModelFile(ModelCatalog.LLM_GEMMA_2B)
++        if (specificFile.exists() && specificFile.length() > MIN_MODEL_BYTES) {
+             return specificFile
+         }
+ 
+-        // Busca em context.filesDir/models por qualquer arquivo de pesos quantizados (.bin, .task, .gguf)
+         val modelsDir = modelManager.modelsDirectory
+         if (modelsDir.exists()) {
+             val candidates = modelsDir.listFiles { file ->
+-                (file.name.endsWith(".bin") || file.name.endsWith(".task") || file.name.endsWith(".gguf")) &&
+-                    file.length() > 10_000_000L
++                file.isFile &&
++                    (file.name.endsWith(".bin") || file.name.endsWith(".task")) &&
++                    file.length() > MIN_MODEL_BYTES
+             }
+             if (!candidates.isNullOrEmpty()) {
+-                return candidates.first()
++                return candidates.maxByOrNull { it.length() }
+             }
+         }
+         return null
+     }
+ 
+-    /**
+-     * Garante o carregamento do LlmInference uma única vez (thread-safe e singleton).
+-     */
++    /** Carrega o LlmInference uma única vez (thread-safe). */
+     override suspend fun loadModel(): Result<Unit> = withContext(Dispatchers.IO) {
+         mutex.withLock {
+-            if (llmInference != null) {
+-                return@withContext Result.success(Unit)
+-            }
+-            if (isInitializing) {
+-                return@withContext Result.success(Unit)
+-            }
++            if (llmInference != null) return@withLock Result.success(Unit)
+ 
+-            val modelFile = findModelFile() ?: return@withContext Result.failure(
+-                IllegalStateException("Arquivo do modelo LLM não encontrado em filesDir/models")
+-            )
++            val modelFile = findModelFile()
++            if (modelFile == null) {
++                val msg = "Modelo de IA não encontrado. Baixe o Gemma 2B na tela de modelos."
++                lastLoadError = msg
++                return@withLock Result.failure(IllegalStateException(msg))
++            }
+ 
+-            isInitializing = true
+             try {
+-                Log.d(tag, "Carregando modelo LlmInference do caminho permanente: ${modelFile.absolutePath}")
++                Log.d(tag, "Carregando LlmInference: ${modelFile.absolutePath} (${modelFile.length()} bytes)")
+                 val options = LlmInference.LlmInferenceOptions.builder()
+                     .setModelPath(modelFile.absolutePath)
+-                    .setMaxTokens(512)
++                    // maxTokens = entrada (prompt + histórico) + saída. 512 era pouco para conversa.
++                    .setMaxTokens(MAX_TOKENS)
++                    .setTopK(40)
++                    .setTemperature(0.8f)
++                    .setRandomSeed(System.currentTimeMillis().toInt())
+                     .build()
+ 
+                 llmInference = LlmInference.createFromOptions(context, options)
+-                Log.d(tag, "LlmInference carregado com sucesso como Singleton.")
+-                isInitializing = false
++                lastLoadError = null
++                Log.d(tag, "LlmInference carregado com sucesso.")
+                 Result.success(Unit)
+-            } catch (e: Exception) {
+-                Log.e(tag, "Falha ao inicializar LlmInference a partir de ${modelFile.name}", e)
++            } catch (e: Throwable) {
++                // Throwable: falhas nativas (UnsatisfiedLinkError, OOM) não são Exception.
++                Log.e(tag, "Falha ao inicializar LlmInference com ${modelFile.name}", e)
+                 llmInference = null
+-                isInitializing = false
+-                Result.failure(e)
++                val msg = "Não foi possível carregar o modelo de IA (${modelFile.name}): ${e.message ?: e.javaClass.simpleName}"
++                lastLoadError = msg
++                Result.failure(IllegalStateException(msg, e))
+             }
+         }
+     }
+ 
+-    private suspend fun ensureLoaded() {
++    /** Gera a resposta completa (bloqueante, em IO) e devolve o texto limpo. Lança em caso de falha. */
++    private suspend fun runInference(
++        prompt: String,
++        history: List<MessageEntity>,
++        userLevel: String
++    ): String = withContext(Dispatchers.IO) {
+         if (llmInference == null) {
+-            loadModel()
++            loadModel().exceptionOrNull()?.let { throw it }
+         }
++        val fullPrompt = buildTutorPrompt(prompt, history, userLevel)
++
++        val raw = mutex.withLock {
++            val inference = llmInference
++                ?: throw IllegalStateException(lastLoadError ?: "Modelo de IA não carregado.")
++            inference.generateResponse(fullPrompt)
++        }
++
++        val cleaned = cleanModelOutput(raw)
++        if (cleaned.isBlank() || looksLikeInstructionEcho(cleaned)) {
++            Log.w(tag, "Saída vazia ou eco das instruções. Bruto: $raw")
++            throw IllegalStateException("O modelo não gerou uma resposta válida. Tente reformular a frase.")
++        }
++        cleaned
+     }
+ 
+     override suspend fun generateTutorReply(
+@@ -106,29 +134,10 @@ class MediaPipeTutorLlmEngine(
+         history: List<MessageEntity>,
+         userLevel: String,
+         targetLanguage: String
+-    ): Result<String> = withContext(Dispatchers.IO) {
+-        ensureLoaded()
+-        val fullPrompt = buildTutorPrompt(prompt)
+-
+-        mutex.withLock {
+-            val inference = llmInference
+-            if (inference != null) {
+-                try {
+-                    val rawResponse = inference.generateResponse(fullPrompt)
+-                    val cleaned = cleanModelOutput(rawResponse)
+-                    if (cleaned.isNotBlank()) {
+-                        return@withContext Result.success(cleaned)
+-                    }
+-                } catch (e: Exception) {
+-                    Log.w(tag, "Erro na inferência nativa do MediaPipe, acionando fallback inteligente", e)
+-                }
+-            }
+-
+-            // Fallback bilíngue conversacional direto sem metatextos
+-            val simulated = generateIntelligentFallback(prompt)
+-            val cleanedFallback = cleanModelOutput(simulated)
+-            Result.success(cleanedFallback)
+-        }
++    ): Result<String> = try {
++        Result.success(runInference(prompt, history, userLevel))
++    } catch (e: Exception) {
++        Result.failure(e)
+     }
+ 
+     override fun generateTutorReplyStream(
+@@ -137,179 +146,113 @@ class MediaPipeTutorLlmEngine(
+         userLevel: String,
+         targetLanguage: String
+     ): Flow<String> = flow {
+-        ensureLoaded()
+-        val fullPrompt = buildTutorPrompt(prompt)
+-
+-        val hasNativeModel = mutex.withLock { llmInference != null }
+-
+-        if (hasNativeModel) {
+-            var fullResponse = ""
+-            try {
+-                fullResponse = mutex.withLock {
+-                    llmInference?.generateResponse(fullPrompt) ?: ""
+-                }
+-            } catch (e: Exception) {
+-                Log.w(tag, "Erro no streaming do MediaPipe, revertendo para fallback inteligente", e)
+-                fullResponse = ""
+-            }
+-
+-            val cleaned = cleanModelOutput(fullResponse)
+-            if (cleaned.isNotBlank()) {
+-                val tokens = cleaned.split(Regex("(?<=\\s)"))
+-                val buffer = StringBuilder()
+-                for (token in tokens) {
+-                    buffer.append(token)
+-                    emit(buffer.toString())
+-                    delay(25)
+-                }
+-                return@flow
+-            }
+-        }
++        val cleaned = runInference(prompt, history, userLevel)
+ 
+-        // Streaming do fallback bilíngue direto
+-        val simulated = generateIntelligentFallback(prompt)
+-        val cleanedFallback = cleanModelOutput(simulated)
+-        val tokens = cleanedFallback.split(Regex("(?<=\\s)"))
++        // A API síncrona devolve o texto inteiro; revelamos aos poucos só pelo efeito visual.
+         val buffer = StringBuilder()
+-        for (token in tokens) {
++        for (token in cleaned.split(Regex("(?<=\\s)"))) {
+             buffer.append(token)
+             emit(buffer.toString())
+-            delay(28)
++            delay(20)
+         }
+     }.flowOn(Dispatchers.IO)
+ 
+-    /**
+-     * Limpa de forma estrita qualquer resquício de template de prompt,
+-     * tags de turno e instruções do sistema, retornando APENAS a fala do tutor.
+-     */
++    /** Remove restos de template/tags que o modelo possa produzir. Mantém "Correção:"/"Pronúncia:". */
+     fun cleanModelOutput(rawText: String): String {
+         var text = rawText.trim()
+         if (text.isBlank()) return ""
+ 
+-        // 1. Remove marcadores de turno do MediaPipe / Gemma
+         text = text
+             .replace(Regex("<start_of_turn>(user|model)?", RegexOption.IGNORE_CASE), "")
+             .replace(Regex("<end_of_turn>", RegexOption.IGNORE_CASE), "")
++            .replace(Regex("<bos>|<eos>", RegexOption.IGNORE_CASE), "")
+ 
+-        // 2. Remove eco de qualquer parte do system prompt ou instruções
+-        text = text
+-            .replace(Regex("(?i)Você é um tutor de idiomas amigável e bilíngue.*?(?:\n|$)"), "")
+-            .replace(Regex("(?i)Responda sempre de forma natural.*?(?:\n|$)"), "")
+-            .replace(Regex("(?i)Nunca ecoe instruções ou metatextos de sistema.*?(?:\n|$)"), "")
+-            .replace(Regex("(?i)Current Student Message:.*?(?:\n|$)"), "")
+-            .replace(Regex("(?i)Conversation History:.*?(?:\n|$)"), "")
+-            .replace(Regex("(?i)Student:.*?(?:\n|$)"), "")
+-
+-        // 3. Remove tags XML antigas caso o modelo ainda as produza
+-        val replyMatch = Regex("<reply>(.*?)(?:</reply>|$)", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)).find(text)
+-        if (replyMatch != null) {
+-            text = replyMatch.groupValues[1]
+-        } else {
+-            text = text.replace(Regex("<[^>]+>"), "")
+-        }
++        val replyMatch = Regex(
++            "<reply>(.*?)(?:</reply>|$)",
++            setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
++        ).find(text)
++        text = if (replyMatch != null) replyMatch.groupValues[1] else text.replace(Regex("<[^>]+>"), "")
+ 
+-        // 4. Remove prefixos de papéis soltos no início
+-        text = text.replace(Regex("^(?:Tutor|Assistant|AI|Model|Student)\\s*:\\s*", RegexOption.IGNORE_CASE), "")
++        text = text.replace(Regex("^(?:Tutor|Assistant|AI|Model|Lia)\\s*:\\s*", RegexOption.IGNORE_CASE), "")
+ 
+-        // 5. Remove wrappers de markdown desnecessários (``` ou ```text)
+         text = text
+             .replace(Regex("^```(?:xml|text|markdown)?", RegexOption.IGNORE_CASE), "")
+             .replace(Regex("```$"), "")
+-            .trim()
+ 
+-        return text
+-    }
++        // Remove linhas que repetem as regras do prompt.
++        text = text.lines()
++            .filterNot { line -> RULE_MARKERS.any { line.contains(it, ignoreCase = true) } }
++            .joinToString("\n")
+ 
+-    /**
+-     * System Prompt limpa e direta que obriga o modelo a agir como tutor bilíngue,
+-     * sem metatextos de controle nem tags complexas que possam ser ecoadas.
+-     */
+-    private fun buildTutorPrompt(userInput: String): String {
+-        val cleanInput = userInput.trim()
+-        return "<start_of_turn>user\n" +
+-            "Você é um tutor de idiomas amigável e bilíngue. Responda sempre de forma natural, mesclando português e inglês para ajudar o usuário a aprender. Nunca ecoe instruções ou metatextos de sistema.\n\n" +
+-            "$cleanInput<end_of_turn>\n" +
+-            "<start_of_turn>model\n"
++        return text.trim()
+     }
+ 
++    private fun looksLikeInstructionEcho(text: String): Boolean =
++        RULE_MARKERS.any { text.contains(it, ignoreCase = true) }
++
+     /**
+-     * Fallback conversacional direto (estilo Biconfident) sem tags XML ou metatextos.
++     * Monta o prompt no template do Gemma, com histórico recente.
++     * Gemma não tem papel "system": as regras vão no primeiro turno do usuário.
+      */
+-    private fun generateIntelligentFallback(input: String): String {
+-        val trimmed = input.trim()
+-        val lower = trimmed.lowercase()
+-
+-        val isAskingHowToSay = lower.contains("como se diz") ||
+-            lower.contains("como eu digo") ||
+-            lower.contains("como falo") ||
+-            lower.contains("como fala") ||
+-            lower.contains("como dizer") ||
+-            lower.contains("o que significa") ||
+-            lower.contains("qual o significado") ||
+-            lower.contains("como usar") ||
+-            lower.startsWith("como ") ||
+-            lower.startsWith("o que ") ||
+-            lower.startsWith("qual ")
+-
+-        val hasPortugueseGreeting = listOf("oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "e aí", "e ai", "tudo bem").any {
+-            lower == it || lower.startsWith("$it ") || lower.contains(" $it")
+-        }
+-
+-        val hasEnglishGreeting = listOf("hello", "hi", "hey", "good morning", "good afternoon", "good evening").any {
+-            lower == it || lower.startsWith("$it ") || lower.contains(" $it")
+-        }
+-
+-        val hasPortugueseWords = lower.any { it in "ãõáéíóúçêô" } ||
+-            listOf("você", "obrigado", "valeu", "por favor", "meu nome", "quero", "tenho", "anos", "trabalho", "estudo", "gosto", "ajuda", "entendi").any { lower.contains(it) }
+-
+-        val hasEnglishWords = listOf("how are you", "my name is", "i am", "i want", "i have", "because", "what", "like", "english", "practice").any { lower.contains(it) }
+-
+-        return when {
+-            // Caso 1: Saudações em português ou mistas
+-            hasPortugueseGreeting -> {
+-                "Oi! Que alegria ter você aqui para praticar inglês hoje! How are you doing today? Como está sendo seu dia? Vamos bater um papo em inglês!"
+-            }
+-
+-            // Caso 2: Pergunta de tradução ou vocabulário
+-            isAskingHowToSay -> {
+-                val queryTerm = trimmed
+-                    .replace(Regex("(?i)^(como se diz|como eu digo|como falo|como fala|como dizer|o que significa|qual o significado de)\\s*"), "")
+-                    .trim('?', ' ', '.', ':', '"', '\'')
+-
+-                val cleanQuery = if (queryTerm.isNotBlank()) queryTerm else "essa ideia"
+-                "Ah, excelente pergunta! Para dizer \"$cleanQuery\" em inglês, você pode falar: \"How do I say this?\". Por exemplo: \"I want to practice this today!\". Repete comigo para fixar, soa super natural!"
+-            }
+-
+-            // Caso 3: Mistura de Português e Inglês (Code-Switching)
+-            (hasPortugueseWords || hasPortugueseGreeting) && hasEnglishWords -> {
+-                "Compreendi perfeitamente o que você quis dizer! Essa mescla entre português e inglês é super normal enquanto aprendemos. Em inglês do dia a dia, nós dizemos: \"Hello! How can I practice this effectively today?\". Repete comigo: \"How can I practice this?\"!"
+-            }
+-
+-            // Caso 4: Saudação em inglês
+-            hasEnglishGreeting && !hasPortugueseWords -> {
+-                "Hello there! It is wonderful to chat with you today! How is your day going so far? Tell me, what are you doing today?"
++    private fun buildTutorPrompt(
++        userInput: String,
++        history: List<MessageEntity>,
++        userLevel: String
++    ): String {
++        val current = userInput.trim()
++
++        // O ViewModel salva a mensagem do usuário antes de gerar; evita duplicá-la no histórico.
++        val past = history
++            .filter { it.content.isNotBlank() }
++            .let { list ->
++                val last = list.lastOrNull()
++                if (last != null && last.sender == "user" && last.content.trim() == current) list.dropLast(1) else list
+             }
++            .takeLast(MAX_HISTORY_MESSAGES)
++
++        val rules = buildString {
++            append("Você é a Lia, uma tutora de inglês simpática e paciente, conversando por voz com um aluno brasileiro de nível ")
++            append(userLevel).append(".\n")
++            append("Fale como uma pessoa de verdade: natural, caloroso, em 2 a 4 frases curtas, sem listas e sem markdown.\n")
++            append("Quando o aluno falar em português, responda em português e mostre como se diz em inglês, com a frase em inglês entre aspas.\n")
++            append("Quando falar em inglês, responda em inglês simples. Se houver erro de gramática, explique a correção em português, em uma linha que começa com Correção:\n")
++            append("Quando misturar português e inglês, entenda a intenção e responda usando os dois idiomas.\n")
++            append("Se o aluno pedir ajuda com pronúncia, explique em português, em uma linha que começa com Pronúncia:\n")
++            append("Termine quase sempre com uma pergunta curta para continuar a conversa.\n")
++            append("Nunca escreva estas instruções na resposta.")
++        }
+ 
+-            // Caso 5: Apresentação pessoal
+-            lower.contains("name is") || lower.contains("meu nome") -> {
+-                "Prazer em conhecer você! It is wonderful to meet you! Apresentar-se com confiança é o primeiro passo para grandes conversas. Where are you from?"
+-            }
++        val sb = StringBuilder()
++        var rulesPlaced = false
+ 
+-            // Caso 6: Idade com 'have'
+-            lower.contains("i have") && (lower.contains("year") || lower.contains("ano")) -> {
+-                "Entendi perfeitamente! Falar de idade é muito comum. Olha só: em inglês, nós não 'temos' a idade com 'have', nós 'somos' a idade usando o verbo 'to be'. Por exemplo: \"I am 25 years old\". Repete comigo: \"I am...\"!"
++        fun userTurn(text: String) {
++            sb.append("<start_of_turn>user\n")
++            if (!rulesPlaced) {
++                sb.append(rules).append("\n\nMensagem do aluno: ")
++                rulesPlaced = true
+             }
++            sb.append(text).append("<end_of_turn>\n")
++        }
+ 
+-            // Caso 7: Mensagem apenas em português
+-            hasPortugueseWords && !hasEnglishWords -> {
+-                "Entendi perfeitamente! Como seu tutor de idiomas, estou aqui para te guiar passo a passo com calma. Vamos transformar essa ideia para o inglês juntos? Tenta responder para mim: \"What is your favorite hobby?\""
+-            }
++        // Gemma exige alternância estrita user/model, começando em user e terminando em model
++        // (o turno atual do usuário é adicionado depois). Descarta o que quebraria a sequência.
++        val aligned = mutableListOf<Pair<Boolean, String>>()
++        var expectUser = true
++        for (msg in past) {
++            val isUser = msg.sender == "user"
++            if (isUser != expectUser) continue
++            aligned += isUser to TutorResponseParser.cleanTemplateArtifacts(msg.content).take(400)
++            expectUser = !expectUser
++        }
++        if (aligned.isNotEmpty() && aligned.last().first) aligned.removeAt(aligned.lastIndex)
+ 
+-            // Caso 8: Entrada em inglês padrão
+-            else -> {
+-                "That sounds really interesting! You are expressing yourself very well. Could you tell me a little bit more about that?"
+-            }
++        for ((isUser, text) in aligned) {
++            if (isUser) userTurn(text) else sb.append("<start_of_turn>model\n").append(text).append("<end_of_turn>\n")
+         }
++
++        userTurn(current)
++        sb.append("<start_of_turn>model\n")
++        return sb.toString()
+     }
+ 
+     override fun unload() {
+@@ -320,4 +263,19 @@ class MediaPipeTutorLlmEngine(
+         }
+         llmInference = null
+     }
++
++    private companion object {
++        const val MIN_MODEL_BYTES = 100_000_000L
++        const val MAX_TOKENS = 1024
++        const val MAX_HISTORY_MESSAGES = 6
++
++        /** Trechos que só aparecem se o modelo ecoar as instruções. */
++        val RULE_MARKERS = listOf(
++            "Você é a Lia",
++            "Nunca escreva estas instruções",
++            "Mensagem do aluno:",
++            "Quando o aluno falar",
++            "Quando misturar português"
++        )
++    }
+ }
+diff --git a/app/src/main/java/com/linguaflow/app/engine/llm/TutorResponseParser.kt b/app/src/main/java/com/linguaflow/app/engine/llm/TutorResponseParser.kt
+index 6d70fe3..4ebcf37 100644
+--- a/app/src/main/java/com/linguaflow/app/engine/llm/TutorResponseParser.kt
++++ b/app/src/main/java/com/linguaflow/app/engine/llm/TutorResponseParser.kt
+@@ -72,8 +72,10 @@ object TutorResponseParser {
+     }
+ 
+     private fun parseUntagged(text: String): TutorFeedback {
+-        val fixIndex = text.indexOf("Fix:", ignoreCase = true)
+-            .takeIf { it != -1 } ?: text.indexOf("Correções:", ignoreCase = true).takeIf { it != -1 }
++        val fixIndex = listOf("Fix:", "Correção:", "Correções:")
++            .map { text.indexOf(it, ignoreCase = true) }
++            .filter { it != -1 }
++            .minOrNull()
+         val pronIndex = text.indexOf("Pron:", ignoreCase = true)
+             .takeIf { it != -1 } ?: text.indexOf("Pronúncia:", ignoreCase = true).takeIf { it != -1 }
+ 
+@@ -92,7 +94,7 @@ object TutorResponseParser {
+ 
+         val fix = if (fixIndex != null) {
+             val end = pronIndex?.takeIf { it > fixIndex } ?: text.length
+-            text.substring(fixIndex, end).replace(Regex("^(Fix:|Correções:)", RegexOption.IGNORE_CASE), "").trim()
++            text.substring(fixIndex, end).replace(Regex("^(Fix:|Correção:|Correções:)", RegexOption.IGNORE_CASE), "").trim()
+         } else null
+ 
+         val pron = if (pronIndex != null) {
+diff --git a/app/src/main/java/com/linguaflow/app/engine/stt/SherpaWhisperSpeechToTextEngine.kt b/app/src/main/java/com/linguaflow/app/engine/stt/SherpaWhisperSpeechToTextEngine.kt
+index 48d3dee..6bde55c 100644
+--- a/app/src/main/java/com/linguaflow/app/engine/stt/SherpaWhisperSpeechToTextEngine.kt
++++ b/app/src/main/java/com/linguaflow/app/engine/stt/SherpaWhisperSpeechToTextEngine.kt
+@@ -34,6 +34,10 @@ class SherpaWhisperSpeechToTextEngine(
+ 
+     private val tag = "SherpaWhisperStt"
+ 
++    private companion object {
++        const val REAL_TRANSCRIPTION_IMPLEMENTED = false
++    }
++
+     private val _state = MutableStateFlow<SttState>(SttState.Idle)
+     override val state: StateFlow<SttState> = _state.asStateFlow()
+ 
+@@ -52,6 +56,11 @@ class SherpaWhisperSpeechToTextEngine(
+     }
+ 
+     fun isWhisperModelAvailable(): Boolean {
++        // STUB: a transcrição real com sherpa-onnx ainda não está implementada neste motor
++        // (não há dependência sherpa-onnx no build.gradle.kts). Enquanto isso, nunca anuncia
++        // disponibilidade, para o app não usar a "transcrição" fixa de demonstração.
++        if (!REAL_TRANSCRIPTION_IMPLEMENTED) return false
++
+         val modelsDir = File(context.filesDir, "models")
+         if (!modelsDir.exists()) return false
+ 
+diff --git a/app/src/main/java/com/linguaflow/app/engine/stt/SmartSpeechToTextEngine.kt b/app/src/main/java/com/linguaflow/app/engine/stt/SmartSpeechToTextEngine.kt
+index 9b3048c..3d2e0f8 100644
+--- a/app/src/main/java/com/linguaflow/app/engine/stt/SmartSpeechToTextEngine.kt
++++ b/app/src/main/java/com/linguaflow/app/engine/stt/SmartSpeechToTextEngine.kt
+@@ -21,6 +21,10 @@ class SmartSpeechToTextEngine(
+ 
+     private var activeEngine: SpeechToTextEngine = voskEngine
+ 
++    private companion object {
++        const val USE_WHISPER = false
++    }
++
+     init {
+         scope.launch {
+             whisperEngine.state.collect { if (activeEngine == whisperEngine) _state.value = it }
+@@ -37,18 +41,14 @@ class SmartSpeechToTextEngine(
+         onFinal: (String, List<WordConfidence>) -> Unit,
+         onError: (String) -> Unit
+     ) {
+-        // Automatic graceful selection: if Whisper ONNX is available locally, use Fase B; else use Fase A (Vosk)
+-        activeEngine = if (whisperEngine.isWhisperModelAvailable()) {
+-            whisperEngine
+-        } else {
+-            voskEngine
+-        }
++        // O motor Whisper (SherpaWhisperSpeechToTextEngine) ainda é um STUB: não roda o modelo e
++        // devolve texto fixo. Só voltamos a selecioná-lo quando houver transcrição real.
++        activeEngine = if (USE_WHISPER && whisperEngine.isWhisperModelAvailable()) whisperEngine else voskEngine
+ 
+         activeEngine.startListening(
+             onPartial = onPartial,
+             onFinal = onFinal,
+             onError = { err ->
+-                // If Whisper failed, gracefully attempt fallback to Vosk
+                 if (activeEngine == whisperEngine) {
+                     activeEngine = voskEngine
+                     voskEngine.startListening(onPartial, onFinal, onError)
+@@ -60,10 +60,8 @@ class SmartSpeechToTextEngine(
+     }
+ 
+     override fun stopListening() {
++        // Só o motor ativo. Parar os três fazia cada um disparar onFinal e sobrescrever a fala real.
+         activeEngine.stopListening()
+-        whisperEngine.stopListening()
+-        voskEngine.stopListening()
+-        _state.value = SttState.Idle
+     }
+ 
+     override fun release() {
+diff --git a/app/src/main/java/com/linguaflow/app/engine/stt/VoskSpeechToTextEngine.kt b/app/src/main/java/com/linguaflow/app/engine/stt/VoskSpeechToTextEngine.kt
+index 8743bf1..f67613e 100644
+--- a/app/src/main/java/com/linguaflow/app/engine/stt/VoskSpeechToTextEngine.kt
++++ b/app/src/main/java/com/linguaflow/app/engine/stt/VoskSpeechToTextEngine.kt
+@@ -10,12 +10,12 @@ import com.linguaflow.app.engine.WordConfidence
+ import com.linguaflow.app.engine.audio.AudioRecorder
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.Job
+-import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
+ import kotlinx.coroutines.withContext
+ import org.json.JSONObject
+ import org.vosk.Model
+@@ -25,6 +25,17 @@ import java.io.FileInputStream
+ import java.io.FileOutputStream
+ import java.util.zip.ZipInputStream
+ 
++/**
++ * STT offline com Vosk (modelo pequeno em inglês).
++ *
++ * Regras desta versão (corrigem o travamento do microfone):
++ *  - NUNCA inventa texto. Se não reconheceu nada, devolve texto vazio e a UI avisa o usuário.
++ *  - stopListening() é idempotente: só a primeira chamada de cada sessão dispara onFinal.
++ *    (Antes, cada chamada extra injetava "Hello! How are you?" por cima da fala real.)
++ *  - O Recognizer só é usado dentro de recognizerLock, então fechar o recognizer nunca
++ *    acontece no meio de acceptWaveForm (evita crash nativo).
++ *  - Frases já finalizadas são acumuladas, então o texto parcial não perde o começo da fala.
++ */
+ class VoskSpeechToTextEngine(
+     private val context: Context,
+     private val modelManager: ModelDownloadManager,
+@@ -37,66 +48,68 @@ class VoskSpeechToTextEngine(
+     override val state: StateFlow<SttState> = _state.asStateFlow()
+ 
+     private var voskModel: Model? = null
+-    private var activeRecognizer: Recognizer? = null
++    private val modelMutex = Mutex()
+     private val audioRecorder = AudioRecorder(sampleRate = 16000, scope = scope)
+-    private var isModelLoading = false
+ 
++    private val recognizerLock = Any()
++    private var activeRecognizer: Recognizer? = null
++    private var committedText = ""
++    private var lastPartial = ""
++
++    @Volatile
++    private var sessionId = 0
++
++    @Volatile
++    private var sessionActive = false
++
++    @Volatile
+     private var onPartialCallback: ((String) -> Unit)? = null
+-    private var onFinalCallback: ((String, List<WordConfidence>) -> Unit)? = null
+-    private var onErrorCallback: ((String) -> Unit)? = null
+ 
+-    private var fallbackJob: Job? = null
++    @Volatile
++    private var onFinalCallback: ((String, List<WordConfidence>) -> Unit)? = null
+ 
+     init {
+-        scope.launch {
+-            initModelIfNeeded()
+-        }
++        scope.launch { initModelIfNeeded() }
+     }
+ 
+     private suspend fun initModelIfNeeded(): Boolean = withContext(Dispatchers.IO) {
+-        if (voskModel != null) return@withContext true
+-        if (isModelLoading) return@withContext false
+-
+-        isModelLoading = true
+-        try {
+-            val modelDir = getOrExtractModelDirectory()
+-            if (modelDir != null && modelDir.exists() && modelDir.isDirectory) {
+-                Log.d(tag, "Carregando modelo Vosk de: ${modelDir.absolutePath}")
+-                voskModel = Model(modelDir.absolutePath)
+-                Log.d(tag, "Modelo Vosk carregado com sucesso.")
+-                isModelLoading = false
+-                return@withContext true
++        modelMutex.withLock {
++            if (voskModel != null) return@withLock true
++            try {
++                val modelDir = getOrExtractModelDirectory()
++                if (modelDir != null && modelDir.isDirectory) {
++                    Log.d(tag, "Carregando modelo Vosk de: ${modelDir.absolutePath}")
++                    voskModel = Model(modelDir.absolutePath)
++                    Log.d(tag, "Modelo Vosk carregado.")
++                }
++            } catch (e: Throwable) {
++                Log.e(tag, "Erro ao carregar modelo Vosk: ${e.message}", e)
+             }
+-        } catch (e: Exception) {
+-            Log.e(tag, "Erro ao carregar modelo Vosk: ${e.message}", e)
++            voskModel != null
+         }
+-        isModelLoading = false
+-        return@withContext false
+     }
+ 
+     private fun getOrExtractModelDirectory(): File? {
+         val modelsDir = modelManager.modelsDirectory
+         if (!modelsDir.exists()) return null
+ 
+-        // Verifica se pasta já descompactada existe
+         val existingFolder = modelsDir.listFiles { file ->
+-            file.isDirectory && file.name.contains("vosk", ignoreCase = true)
++            file.isDirectory && file.name.contains("vosk", ignoreCase = true) && File(file, "am").exists()
+         }?.firstOrNull()
++        if (existingFolder != null) return existingFolder
+ 
+-        if (existingFolder != null && File(existingFolder, "am").exists()) {
+-            return existingFolder
+-        }
+-
+-        // Verifica zip baixado
+         val zipFile = modelManager.getModelFile(ModelCatalog.STT_VOSK_EN)
+         if (zipFile.exists() && zipFile.length() > 100_000L) {
+             try {
+                 val targetDir = File(modelsDir, "vosk-model-small-en-us-0.15")
++                // Extração anterior interrompida deixa a pasta pela metade: refaz do zero.
++                if (targetDir.exists() && !File(targetDir, "am").exists()) {
++                    targetDir.deleteRecursively()
++                }
+                 if (!targetDir.exists()) {
+-                    targetDir.mkdirs()
+                     unzip(zipFile, modelsDir)
+                 }
+-                return targetDir
++                return targetDir.takeIf { File(it, "am").exists() }
+             } catch (e: Exception) {
+                 Log.e(tag, "Erro ao descompactar modelo Vosk", e)
+             }
+@@ -105,11 +118,14 @@ class VoskSpeechToTextEngine(
+     }
+ 
+     private fun unzip(zipFile: File, targetDirectory: File) {
++        val rootPath = targetDirectory.canonicalPath + File.separator
+         ZipInputStream(FileInputStream(zipFile)).use { zis ->
+             var entry = zis.nextEntry
+             val buffer = ByteArray(8192)
+             while (entry != null) {
+                 val newFile = File(targetDirectory, entry.name)
++                // Proteção contra zip-slip (entradas com "../").
++                require(newFile.canonicalPath.startsWith(rootPath)) { "Entrada de zip inválida: ${entry.name}" }
+                 if (entry.isDirectory) {
+                     newFile.mkdirs()
+                 } else {
+@@ -127,198 +143,154 @@ class VoskSpeechToTextEngine(
+         }
+     }
+ 
+-    override fun isListening(): Boolean {
+-        return _state.value is SttState.Listening || audioRecorder.isRecording.value
+-    }
++    override fun isListening(): Boolean = sessionActive
+ 
+     override fun startListening(
+         onPartial: (String) -> Unit,
+         onFinal: (String, List<WordConfidence>) -> Unit,
+         onError: (String) -> Unit
+     ) {
+-        stopListening()
++        // Encerra qualquer sessão anterior SEM disparar callbacks (o bug do texto falso vinha daqui).
++        endSession(emitFinal = false)
+ 
+         onPartialCallback = onPartial
+         onFinalCallback = onFinal
+-        onErrorCallback = onError
++        committedText = ""
++        lastPartial = ""
++        sessionActive = true
++        val mySession = ++sessionId
+ 
+         scope.launch {
+             val ready = initModelIfNeeded()
+             val model = voskModel
+ 
+-            if (ready && model != null) {
+-                try {
+-                    val recognizer = Recognizer(model, 16000.0f)
+-                    recognizer.setWords(true)
+-                    activeRecognizer = recognizer
+-
+-                    val started = audioRecorder.start(
+-                        onAudioChunk = { pcmChunk, bytesRead ->
+-                            try {
+-                                if (recognizer.acceptWaveForm(pcmChunk, bytesRead)) {
+-                                    val res = recognizer.result
+-                                    parseAndEmitResult(res, isFinal = false)
+-                                } else {
+-                                    val partial = recognizer.partialResult
+-                                    parseAndEmitPartial(partial)
+-                                }
+-                            } catch (e: Exception) {
+-                                Log.e(tag, "Erro ao processar chunk PCM no Vosk Recognizer", e)
+-                            }
+-                        },
+-                        onStarted = {
+-                            _state.value = SttState.Listening
+-                            Log.d(tag, "AudioRecorder conectado ao Vosk Recognizer com sucesso.")
+-                        },
+-                        onError = { err ->
+-                            Log.e(tag, "Falha no AudioRecord nativo: $err")
+-                            _state.value = SttState.Error(err)
+-                            onErrorCallback?.invoke(err)
+-                        },
+-                        onSilenceDetected = {
+-                            Log.d(tag, "Silêncio detectado pelo AudioRecorder. Finalizando escuta e emitindo texto.")
+-                            scope.launch(Dispatchers.Main) {
+-                                stopListening()
+-                            }
+-                        }
+-                    )
++            // O usuário pode ter parado (ou iniciado outra sessão) enquanto o modelo carregava.
++            if (mySession != sessionId) return@launch
+ 
+-                    if (!started) {
+-                        Log.w(tag, "AudioRecorder não pôde iniciar gravação, usando modo fallback interativo.")
+-                        startFallbackListening()
+-                    }
+-                } catch (e: Exception) {
+-                    Log.e(tag, "Erro ao instanciar Vosk Recognizer nativo", e)
+-                    startFallbackListening()
+-                }
+-            } else {
+-                Log.d(tag, "Modelo Vosk não disponível localmente, usando modo interativo.")
+-                startFallbackListening()
++            if (!ready || model == null) {
++                sessionActive = false
++                val msg = "Modelo de voz (Vosk) não está instalado. Baixe-o na tela de modelos."
++                _state.value = SttState.Error(msg)
++                onError(msg)
++                return@launch
+             }
+-        }
+-    }
+ 
+-    private fun startFallbackListening() {
+-        fallbackJob?.cancel()
+-        fallbackJob = scope.launch {
+-            _state.value = SttState.Listening
+-            val sampleWords = listOf("Hello", "I", "am", "practicing", "English", "with", "Linguaflow")
+-
+-            delay(800)
+-            onPartialCallback?.invoke("Hello...")
+-            delay(900)
+-            onPartialCallback?.invoke("Hello, I am practicing...")
+-            delay(1200)
+-
+-            _state.value = SttState.Transcribing
+-            delay(300)
+-
+-            val fullText = "Hello, I am practicing English with Linguaflow"
+-            val confidences = sampleWords.map { word ->
+-                WordConfidence(
+-                    word = word,
+-                    confidence = 0.92f,
+-                    startTime = 0.2f,
+-                    endTime = 0.8f
+-                )
++            val recognizer = try {
++                Recognizer(model, 16000.0f).also { it.setWords(true) }
++            } catch (e: Throwable) {
++                Log.e(tag, "Erro ao criar Recognizer do Vosk", e)
++                sessionActive = false
++                val msg = "Falha ao iniciar o reconhecimento de voz: ${e.message}"
++                _state.value = SttState.Error(msg)
++                onError(msg)
++                return@launch
+             }
+ 
+-            _state.value = SttState.Result(fullText, isFinal = true, wordConfidences = confidences)
+-            onFinalCallback?.invoke(fullText, confidences)
+-            _state.value = SttState.Idle
++            synchronized(recognizerLock) { activeRecognizer = recognizer }
++
++            val started = audioRecorder.start(
++                onAudioChunk = { pcm, bytes -> handleChunk(recognizer, pcm, bytes) },
++                onStarted = {
++                    if (mySession == sessionId) _state.value = SttState.Listening
++                },
++                onError = { err ->
++                    Log.e(tag, "Falha no AudioRecord: $err")
++                    endSession(emitFinal = false)
++                    _state.value = SttState.Error(err)
++                    onError(err)
++                },
++                onSilenceDetected = {
++                    Log.d(tag, "Silêncio detectado: finalizando escuta.")
++                    scope.launch(Dispatchers.Main) {
++                        if (mySession == sessionId) stopListening()
++                    }
++                }
++            )
++
++            if (!started) {
++                // O próprio AudioRecorder já chamou onError; só garante que não sobrou estado.
++                endSession(emitFinal = false)
++            } else if (mySession != sessionId) {
++                // Parou durante a inicialização do microfone.
++                audioRecorder.stop()
++            }
+         }
+     }
+ 
+-    private var lastHypothesisText: String = ""
+-
+-    override fun stopListening() {
+-        fallbackJob?.cancel()
+-        fallbackJob = null
+-
+-        audioRecorder.stop()
+-
+-        var emittedFinal = false
+-        activeRecognizer?.let { recognizer ->
++    /** Processa um bloco PCM. Tudo que toca o Recognizer fica sob lock. */
++    private fun handleChunk(recognizer: Recognizer, pcm: ByteArray, bytes: Int) {
++        synchronized(recognizerLock) {
++            if (activeRecognizer !== recognizer) return
+             try {
+-                val finalResult = recognizer.finalResult
+-                if (!finalResult.isNullOrBlank()) {
+-                    val parsed = parseAndEmitResult(finalResult, isFinal = true)
+-                    if (parsed.isNotBlank()) {
+-                        emittedFinal = true
++                if (recognizer.acceptWaveForm(pcm, bytes)) {
++                    val text = JSONObject(recognizer.result).optString("text", "").trim()
++                    lastPartial = ""
++                    if (text.isNotBlank()) {
++                        committedText = join(committedText, text)
++                        onPartialCallback?.invoke(committedText)
++                    }
++                } else {
++                    val partial = JSONObject(recognizer.partialResult).optString("partial", "").trim()
++                    lastPartial = partial
++                    if (partial.isNotBlank()) {
++                        onPartialCallback?.invoke(join(committedText, partial))
+                     }
+                 }
+-                recognizer.close()
+             } catch (e: Exception) {
+-                Log.e(tag, "Erro ao fechar Vosk Recognizer", e)
++                Log.e(tag, "Erro ao processar bloco PCM no Vosk", e)
+             }
+-            activeRecognizer = null
+-        }
+-
+-        // Se nenhuma fala foi reconhecida pelo motor local (buffer vazio ou motor ocupado),
+-        // emite hipótese anterior ou texto de fallback seguro para destravar a caixa de envio
+-        if (!emittedFinal) {
+-            val fallbackText = lastHypothesisText.ifBlank { "Hello! How are you?" }
+-            _state.value = SttState.Result(fallbackText, isFinal = true)
+-            onFinalCallback?.invoke(fallbackText, emptyList())
+         }
+-
+-        lastHypothesisText = ""
+-        _state.value = SttState.Idle
+     }
+ 
+-    private fun parseAndEmitPartial(hypothesis: String?) {
+-        if (hypothesis == null) return
+-        try {
+-            val json = JSONObject(hypothesis)
+-            val partial = json.optString("partial", "").trim()
+-            if (partial.isNotBlank()) {
+-                lastHypothesisText = partial
+-                _state.value = SttState.Result(partial, isFinal = false)
+-                onPartialCallback?.invoke(partial)
+-            }
+-        } catch (e: Exception) {
+-            Log.w(tag, "Erro ao parsear partial do Vosk", e)
+-        }
++    override fun stopListening() {
++        endSession(emitFinal = true)
+     }
+ 
+-    private fun parseAndEmitResult(hypothesis: String, isFinal: Boolean): String {
+-        try {
+-            val json = JSONObject(hypothesis)
+-            val text = json.optString("text", "").trim()
+-            val resultArray = json.optJSONArray("result")
+-
+-            val confidences = mutableListOf<WordConfidence>()
+-            if (resultArray != null) {
+-                for (i in 0 until resultArray.length()) {
+-                    val wordObj = resultArray.getJSONObject(i)
+-                    val word = wordObj.optString("word", "")
+-                    val conf = wordObj.optDouble("conf", 1.0).toFloat()
+-                    val start = wordObj.optDouble("start", 0.0).toFloat()
+-                    val end = wordObj.optDouble("end", 0.0).toFloat()
+-                    if (word.isNotBlank()) {
+-                        confidences.add(WordConfidence(word, conf, start, end))
+-                    }
+-                }
+-            }
++    /**
++     * Encerra a sessão atual. Idempotente: só a chamada que encontra a sessão ativa
++     * pode emitir o resultado final (e apenas quando emitFinal = true).
++     */
++    private fun endSession(emitFinal: Boolean) {
++        val wasActive = sessionActive
++        sessionActive = false
++        sessionId++ // invalida coroutines de início ainda pendentes
+ 
+-            if (text.isNotBlank()) {
+-                lastHypothesisText = text
+-                _state.value = SttState.Result(text, isFinal, confidences)
+-                if (isFinal) {
+-                    onFinalCallback?.invoke(text, confidences)
+-                } else {
+-                    onPartialCallback?.invoke(text)
++        audioRecorder.stop()
++
++        var finalText = ""
++        synchronized(recognizerLock) {
++            val recognizer = activeRecognizer
++            activeRecognizer = null
++            if (recognizer != null) {
++                val tail = try {
++                    JSONObject(recognizer.finalResult).optString("text", "").trim()
++                } catch (e: Exception) {
++                    Log.w(tag, "Erro ao obter finalResult do Vosk", e)
++                    ""
++                }
++                finalText = join(committedText, tail.ifBlank { lastPartial })
++                try {
++                    recognizer.close()
++                } catch (e: Exception) {
++                    Log.w(tag, "Erro ao fechar Recognizer", e)
+                 }
+-                return text
+             }
+-        } catch (e: Exception) {
+-            Log.e(tag, "Erro ao parsear resultado Vosk", e)
++            committedText = ""
++            lastPartial = ""
++        }
++
++        val callback = onFinalCallback
++        _state.value = SttState.Idle
++        if (emitFinal && wasActive) {
++            callback?.invoke(finalText.trim(), emptyList())
+         }
+-        return ""
+     }
+ 
++    private fun join(a: String, b: String): String =
++        listOf(a, b).filter { it.isNotBlank() }.joinToString(" ")
++
+     override fun release() {
+-        stopListening()
++        endSession(emitFinal = false)
+         voskModel?.close()
+         voskModel = null
+         _state.value = SttState.Idle
+diff --git a/app/src/main/java/com/linguaflow/app/ui/screens/ChatScreen.kt b/app/src/main/java/com/linguaflow/app/ui/screens/ChatScreen.kt
+index adacf09..a8327c1 100644
+--- a/app/src/main/java/com/linguaflow/app/ui/screens/ChatScreen.kt
++++ b/app/src/main/java/com/linguaflow/app/ui/screens/ChatScreen.kt
+@@ -125,7 +125,7 @@ fun ChatScreen(
+ 
+     LaunchedEffect(errorMessage) {
+         errorMessage?.let { err ->
+-            Toast.makeText(context, err, Toast.LENGTH_SHORT).show()
++            Toast.makeText(context, err, Toast.LENGTH_LONG).show()
+             viewModel.clearErrorMessage()
+         }
+     }
+diff --git a/app/src/main/java/com/linguaflow/app/ui/viewmodel/TutorChatViewModel.kt b/app/src/main/java/com/linguaflow/app/ui/viewmodel/TutorChatViewModel.kt
+index 3d7d8c5..1a966f8 100644
+--- a/app/src/main/java/com/linguaflow/app/ui/viewmodel/TutorChatViewModel.kt
++++ b/app/src/main/java/com/linguaflow/app/ui/viewmodel/TutorChatViewModel.kt
+@@ -161,8 +161,9 @@ class TutorChatViewModel(
+ 
+                 // 4. Parser rigoroso com limpeza de tags
+                 val finalFeedback: TutorFeedback = TutorResponseParser.parse(fullOutput.toString())
+-                val cleanReply = finalFeedback.reply.ifBlank {
+-                    "Que ótimo! Vamos continuar praticando. Let's keep talking!"
++                val cleanReply = finalFeedback.reply
++                if (cleanReply.isBlank()) {
++                    throw IllegalStateException("O tutor não gerou uma resposta. Tente de novo.")
+                 }
+ 
+                 val storedMetadata = buildString {
+@@ -196,7 +197,7 @@ class TutorChatViewModel(
+ 
+             } catch (e: Exception) {
+                 Log.e(tag, "Erro no processamento da mensagem do tutor", e)
+-                _errorMessage.value = "Erro ao processar resposta: ${e.localizedMessage}"
++                _errorMessage.value = e.localizedMessage ?: "Erro ao gerar a resposta do tutor."
+                 _streamingRawText.value = ""
+                 _uiState.value = ChatUiState.IDLE
+             }
+@@ -217,8 +218,12 @@ class TutorChatViewModel(
+                 _inputText.value = partial
+             },
+             onFinal = { text, _ ->
+-                val resolved = text.ifBlank { "Hello! How are you?" }
+-                _inputText.value = resolved
++                if (text.isBlank()) {
++                    // Nunca inventar texto: avisa que a fala não foi reconhecida.
++                    _errorMessage.value = "Não consegui entender sua voz. Fale perto do microfone e tente de novo."
++                } else {
++                    _inputText.value = text
++                }
+                 _uiState.value = ChatUiState.IDLE
+             },
+             onError = { err ->
+@@ -237,9 +242,6 @@ class TutorChatViewModel(
+     fun stopListening() {
+         sttEngine.stopListening()
+         _uiState.value = ChatUiState.IDLE
+-        if (_inputText.value.isBlank()) {
+-            _inputText.value = "Hello! How are you?"
+-        }
+     }
+ 
+     fun playTtsForMessage(message: MessageEntity) {
+diff --git a/app/src/test/java/com/linguaflow/app/TutorResponseParserTest.kt b/app/src/test/java/com/linguaflow/app/TutorResponseParserTest.kt
+index f3d1824..8e8d731 100644
+--- a/app/src/test/java/com/linguaflow/app/TutorResponseParserTest.kt
++++ b/app/src/test/java/com/linguaflow/app/TutorResponseParserTest.kt
+@@ -51,4 +51,16 @@ class TutorResponseParserTest {
+         assertTrue(parsed.hasPronunciationTip)
+         assertEquals("Em 'juice', o 'j' tem som suave /dʒuːs/.", parsed.pronunciationTip)
+     }
++
++    @Test
++    fun testUntaggedCorrecaoAndPronunciaLabels() {
++        val raw = "Boa! Você quase acertou. Tell me more! Correção: \"I have 20 years\" -> \"I am 20 years old\". Pronúncia: 'old' soa como /oʊld/."
++        val parsed = TutorResponseParser.parse(raw)
++
++        assertTrue(parsed.reply.startsWith("Boa!"))
++        assertFalse(parsed.reply.contains("Correção:"))
++        assertTrue(parsed.hasCorrections)
++        assertTrue(parsed.corrections!!.contains("I am 20 years old"))
++        assertTrue(parsed.hasPronunciationTip)
++    }
+ }
+diff --git a/debug.keystore.base64 b/debug.keystore.base64
+new file mode 100644
+index 0000000..6540f31
+--- /dev/null
++++ b/debug.keystore.base64
+@@ -0,0 +1 @@
++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
+\ No newline at end of file

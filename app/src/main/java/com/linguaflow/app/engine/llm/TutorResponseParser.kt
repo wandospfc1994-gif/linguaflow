@@ -72,8 +72,10 @@ object TutorResponseParser {
     }
 
     private fun parseUntagged(text: String): TutorFeedback {
-        val fixIndex = text.indexOf("Fix:", ignoreCase = true)
-            .takeIf { it != -1 } ?: text.indexOf("Correções:", ignoreCase = true).takeIf { it != -1 }
+        val fixIndex = listOf("Fix:", "Correção:", "Correções:")
+            .map { text.indexOf(it, ignoreCase = true) }
+            .filter { it != -1 }
+            .minOrNull()
         val pronIndex = text.indexOf("Pron:", ignoreCase = true)
             .takeIf { it != -1 } ?: text.indexOf("Pronúncia:", ignoreCase = true).takeIf { it != -1 }
 
@@ -92,7 +94,7 @@ object TutorResponseParser {
 
         val fix = if (fixIndex != null) {
             val end = pronIndex?.takeIf { it > fixIndex } ?: text.length
-            text.substring(fixIndex, end).replace(Regex("^(Fix:|Correções:)", RegexOption.IGNORE_CASE), "").trim()
+            text.substring(fixIndex, end).replace(Regex("^(Fix:|Correção:|Correções:)", RegexOption.IGNORE_CASE), "").trim()
         } else null
 
         val pron = if (pronIndex != null) {

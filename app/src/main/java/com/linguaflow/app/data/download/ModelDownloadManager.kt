@@ -470,6 +470,19 @@ class ModelDownloadManager(
                     }
                 }
 
+                // Só confia no tamanho quando o servidor informou Content-Length. Se o download
+                // terminou antes do esperado, falha para o laço de retry retomar via Range,
+                // em vez de aceitar um arquivo truncado (que depois não carrega no MediaPipe).
+                val declaredLength = responseBody.contentLength()
+                if (declaredLength > 0) {
+                    val expectedTotal = if (isPartial) existingBytes + declaredLength else declaredLength
+                    if (partFile.length() != expectedTotal) {
+                        throw java.io.IOException(
+                            "Download incompleto: ${partFile.length()} de $expectedTotal bytes"
+                        )
+                    }
+                }
+
                 isCompleted = true
 
             } catch (e: CancellationException) {

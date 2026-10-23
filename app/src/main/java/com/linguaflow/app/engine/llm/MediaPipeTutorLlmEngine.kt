@@ -18,9 +18,15 @@ import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
- * Motor de inferência On-Device MediaPipe para o Tutor Linguaflow (Gemma 2B / Llama).
- * Utiliza um System Prompt limpo e direto sem metatextos ou instruções complexas que vazem
- * no texto gerado, retornando estritamente a conversa natural do tutor bilíngue.
+ * Motor de inferência on-device (MediaPipe LLM Inference) para o tutor bilíngue.
+ *
+ * Princípios desta versão:
+ *  - O prompt segue o template de chat do Gemma (<start_of_turn>user/model) e INCLUI o histórico,
+ *    para o tutor lembrar da conversa.
+ *  - As instruções ficam no primeiro turno do usuário, escritas como regras (sem frases-modelo
+ *    entre colchetes ou aspas que o modelo pequeno possa copiar literalmente).
+ *  - Se o modelo não carregar ou a inferência falhar, o erro é PROPAGADO (a UI mostra o motivo).
+ *    Nada de respostas enlatadas fingindo ser a IA — isso escondia o problema real.
  */
 class MediaPipeTutorLlmEngine(
     private val context: Context,
@@ -30,75 +36,97 @@ class MediaPipeTutorLlmEngine(
     private val tag = "MediaPipeTutorLlm"
     private val mutex = Mutex()
 
-    // Instância única em memória (Singleton/Scoped) do motor de inferência
     private var llmInference: LlmInference? = null
-    private var isInitializing = false
+
+    /** Último motivo de falha ao carregar o modelo (mostrado ao usuário em vez de resposta falsa). */
+    @Volatile
+    var lastLoadError: String? = null
+        private set
 
     override val isModelLoaded: Boolean
         get() = llmInference != null
 
     private fun findModelFile(): File? {
-        val modelInfo = ModelCatalog.LLM_GEMMA_2B
-        val specificFile = modelManager.getModelFile(modelInfo)
-        if (specificFile.exists() && specificFile.length() > 10_000_000L) {
+        val specificFile = modelManager.getModelFile(ModelCatalog.LLM_GEMMA_2B)
+        if (specificFile.exists() && specificFile.length() > MIN_MODEL_BYTES) {
             return specificFile
         }
 
-        // Busca em context.filesDir/models por qualquer arquivo de pesos quantizados (.bin, .task, .gguf)
         val modelsDir = modelManager.modelsDirectory
         if (modelsDir.exists()) {
             val candidates = modelsDir.listFiles { file ->
-                (file.name.endsWith(".bin") || file.name.endsWith(".task") || file.name.endsWith(".gguf")) &&
-                    file.length() > 10_000_000L
+                file.isFile &&
+                    (file.name.endsWith(".bin") || file.name.endsWith(".task")) &&
+                    file.length() > MIN_MODEL_BYTES
             }
             if (!candidates.isNullOrEmpty()) {
-                return candidates.first()
+                return candidates.maxByOrNull { it.length() }
             }
         }
         return null
     }
 
-    /**
-     * Garante o carregamento do LlmInference uma única vez (thread-safe e singleton).
-     */
+    /** Carrega o LlmInference uma única vez (thread-safe). */
     override suspend fun loadModel(): Result<Unit> = withContext(Dispatchers.IO) {
         mutex.withLock {
-            if (llmInference != null) {
-                return@withContext Result.success(Unit)
-            }
-            if (isInitializing) {
-                return@withContext Result.success(Unit)
+            if (llmInference != null) return@withLock Result.success(Unit)
+
+            val modelFile = findModelFile()
+            if (modelFile == null) {
+                val msg = "Modelo de IA não encontrado. Baixe o Gemma 2B na tela de modelos."
+                lastLoadError = msg
+                return@withLock Result.failure(IllegalStateException(msg))
             }
 
-            val modelFile = findModelFile() ?: return@withContext Result.failure(
-                IllegalStateException("Arquivo do modelo LLM não encontrado em filesDir/models")
-            )
-
-            isInitializing = true
             try {
-                Log.d(tag, "Carregando modelo LlmInference do caminho permanente: ${modelFile.absolutePath}")
+                Log.d(tag, "Carregando LlmInference: ${modelFile.absolutePath} (${modelFile.length()} bytes)")
                 val options = LlmInference.LlmInferenceOptions.builder()
                     .setModelPath(modelFile.absolutePath)
-                    .setMaxTokens(512)
+                    // maxTokens = entrada (prompt + histórico) + saída. 512 era pouco para conversa.
+                    .setMaxTokens(MAX_TOKENS)
+                    .setTopK(40)
+                    .setTemperature(0.8f)
+                    .setRandomSeed(System.currentTimeMillis().toInt())
                     .build()
 
                 llmInference = LlmInference.createFromOptions(context, options)
-                Log.d(tag, "LlmInference carregado com sucesso como Singleton.")
-                isInitializing = false
+                lastLoadError = null
+                Log.d(tag, "LlmInference carregado com sucesso.")
                 Result.success(Unit)
-            } catch (e: Exception) {
-                Log.e(tag, "Falha ao inicializar LlmInference a partir de ${modelFile.name}", e)
+            } catch (e: Throwable) {
+                // Throwable: falhas nativas (UnsatisfiedLinkError, OOM) não são Exception.
+                Log.e(tag, "Falha ao inicializar LlmInference com ${modelFile.name}", e)
                 llmInference = null
-                isInitializing = false
-                Result.failure(e)
+                val msg = "Não foi possível carregar o modelo de IA (${modelFile.name}): ${e.message ?: e.javaClass.simpleName}"
+                lastLoadError = msg
+                Result.failure(IllegalStateException(msg, e))
             }
         }
     }
 
-    private suspend fun ensureLoaded() {
+    /** Gera a resposta completa (bloqueante, em IO) e devolve o texto limpo. Lança em caso de falha. */
+    private suspend fun runInference(
+        prompt: String,
+        history: List<MessageEntity>,
+        userLevel: String
+    ): String = withContext(Dispatchers.IO) {
         if (llmInference == null) {
-            loadModel()
+            loadModel().exceptionOrNull()?.let { throw it }
         }
+        val fullPrompt = buildTutorPrompt(prompt, history, userLevel)
+
+        val raw = mutex.withLock {
+            val inference = llmInference
+                ?: throw IllegalStateException(lastLoadError ?: "Modelo de IA não carregado.")
+            inference.generateResponse(fullPrompt)
+        }
+
+        val cleaned = cleanModelOutput(raw)
+        if (cleaned.isBlank() || looksLikeInstructionEcho(cleaned)) {
+            Log.w(tag, "Saída vazia ou eco das instruções. Bruto: $raw")
+            throw IllegalStateException("O modelo não gerou uma resposta válida. Tente reformular a frase.")
+        }
+        cleaned
     }
 
     override suspend fun generateTutorReply(
@@ -106,29 +134,10 @@ class MediaPipeTutorLlmEngine(
         history: List<MessageEntity>,
         userLevel: String,
         targetLanguage: String
-    ): Result<String> = withContext(Dispatchers.IO) {
-        ensureLoaded()
-        val fullPrompt = buildTutorPrompt(prompt)
-
-        mutex.withLock {
-            val inference = llmInference
-            if (inference != null) {
-                try {
-                    val rawResponse = inference.generateResponse(fullPrompt)
-                    val cleaned = cleanModelOutput(rawResponse)
-                    if (cleaned.isNotBlank()) {
-                        return@withContext Result.success(cleaned)
-                    }
-                } catch (e: Exception) {
-                    Log.w(tag, "Erro na inferência nativa do MediaPipe, acionando fallback inteligente", e)
-                }
-            }
-
-            // Fallback bilíngue conversacional direto sem metatextos
-            val simulated = generateIntelligentFallback(prompt)
-            val cleanedFallback = cleanModelOutput(simulated)
-            Result.success(cleanedFallback)
-        }
+    ): Result<String> = try {
+        Result.success(runInference(prompt, history, userLevel))
+    } catch (e: Exception) {
+        Result.failure(e)
     }
 
     override fun generateTutorReplyStream(
@@ -137,179 +146,113 @@ class MediaPipeTutorLlmEngine(
         userLevel: String,
         targetLanguage: String
     ): Flow<String> = flow {
-        ensureLoaded()
-        val fullPrompt = buildTutorPrompt(prompt)
+        val cleaned = runInference(prompt, history, userLevel)
 
-        val hasNativeModel = mutex.withLock { llmInference != null }
-
-        if (hasNativeModel) {
-            var fullResponse = ""
-            try {
-                fullResponse = mutex.withLock {
-                    llmInference?.generateResponse(fullPrompt) ?: ""
-                }
-            } catch (e: Exception) {
-                Log.w(tag, "Erro no streaming do MediaPipe, revertendo para fallback inteligente", e)
-                fullResponse = ""
-            }
-
-            val cleaned = cleanModelOutput(fullResponse)
-            if (cleaned.isNotBlank()) {
-                val tokens = cleaned.split(Regex("(?<=\\s)"))
-                val buffer = StringBuilder()
-                for (token in tokens) {
-                    buffer.append(token)
-                    emit(buffer.toString())
-                    delay(25)
-                }
-                return@flow
-            }
-        }
-
-        // Streaming do fallback bilíngue direto
-        val simulated = generateIntelligentFallback(prompt)
-        val cleanedFallback = cleanModelOutput(simulated)
-        val tokens = cleanedFallback.split(Regex("(?<=\\s)"))
+        // A API síncrona devolve o texto inteiro; revelamos aos poucos só pelo efeito visual.
         val buffer = StringBuilder()
-        for (token in tokens) {
+        for (token in cleaned.split(Regex("(?<=\\s)"))) {
             buffer.append(token)
             emit(buffer.toString())
-            delay(28)
+            delay(20)
         }
     }.flowOn(Dispatchers.IO)
 
-    /**
-     * Limpa de forma estrita qualquer resquício de template de prompt,
-     * tags de turno e instruções do sistema, retornando APENAS a fala do tutor.
-     */
+    /** Remove restos de template/tags que o modelo possa produzir. Mantém "Correção:"/"Pronúncia:". */
     fun cleanModelOutput(rawText: String): String {
         var text = rawText.trim()
         if (text.isBlank()) return ""
 
-        // 1. Remove marcadores de turno do MediaPipe / Gemma
         text = text
             .replace(Regex("<start_of_turn>(user|model)?", RegexOption.IGNORE_CASE), "")
             .replace(Regex("<end_of_turn>", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("<bos>|<eos>", RegexOption.IGNORE_CASE), "")
 
-        // 2. Remove eco de qualquer parte do system prompt ou instruções
-        text = text
-            .replace(Regex("(?i)Você é um tutor de idiomas amigável e bilíngue.*?(?:\n|$)"), "")
-            .replace(Regex("(?i)Responda sempre de forma natural.*?(?:\n|$)"), "")
-            .replace(Regex("(?i)Nunca ecoe instruções ou metatextos de sistema.*?(?:\n|$)"), "")
-            .replace(Regex("(?i)Current Student Message:.*?(?:\n|$)"), "")
-            .replace(Regex("(?i)Conversation History:.*?(?:\n|$)"), "")
-            .replace(Regex("(?i)Student:.*?(?:\n|$)"), "")
+        val replyMatch = Regex(
+            "<reply>(.*?)(?:</reply>|$)",
+            setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
+        ).find(text)
+        text = if (replyMatch != null) replyMatch.groupValues[1] else text.replace(Regex("<[^>]+>"), "")
 
-        // 3. Remove tags XML antigas caso o modelo ainda as produza
-        val replyMatch = Regex("<reply>(.*?)(?:</reply>|$)", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)).find(text)
-        if (replyMatch != null) {
-            text = replyMatch.groupValues[1]
-        } else {
-            text = text.replace(Regex("<[^>]+>"), "")
-        }
+        text = text.replace(Regex("^(?:Tutor|Assistant|AI|Model|Lia)\\s*:\\s*", RegexOption.IGNORE_CASE), "")
 
-        // 4. Remove prefixos de papéis soltos no início
-        text = text.replace(Regex("^(?:Tutor|Assistant|AI|Model|Student)\\s*:\\s*", RegexOption.IGNORE_CASE), "")
-
-        // 5. Remove wrappers de markdown desnecessários (``` ou ```text)
         text = text
             .replace(Regex("^```(?:xml|text|markdown)?", RegexOption.IGNORE_CASE), "")
             .replace(Regex("```$"), "")
-            .trim()
 
-        return text
+        // Remove linhas que repetem as regras do prompt.
+        text = text.lines()
+            .filterNot { line -> RULE_MARKERS.any { line.contains(it, ignoreCase = true) } }
+            .joinToString("\n")
+
+        return text.trim()
     }
 
-    /**
-     * System Prompt limpa e direta que obriga o modelo a agir como tutor bilíngue,
-     * sem metatextos de controle nem tags complexas que possam ser ecoadas.
-     */
-    private fun buildTutorPrompt(userInput: String): String {
-        val cleanInput = userInput.trim()
-        return "<start_of_turn>user\n" +
-            "Você é um tutor de idiomas amigável e bilíngue. Responda sempre de forma natural, mesclando português e inglês para ajudar o usuário a aprender. Nunca ecoe instruções ou metatextos de sistema.\n\n" +
-            "$cleanInput<end_of_turn>\n" +
-            "<start_of_turn>model\n"
-    }
+    private fun looksLikeInstructionEcho(text: String): Boolean =
+        RULE_MARKERS.any { text.contains(it, ignoreCase = true) }
 
     /**
-     * Fallback conversacional direto (estilo Biconfident) sem tags XML ou metatextos.
+     * Monta o prompt no template do Gemma, com histórico recente.
+     * Gemma não tem papel "system": as regras vão no primeiro turno do usuário.
      */
-    private fun generateIntelligentFallback(input: String): String {
-        val trimmed = input.trim()
-        val lower = trimmed.lowercase()
+    private fun buildTutorPrompt(
+        userInput: String,
+        history: List<MessageEntity>,
+        userLevel: String
+    ): String {
+        val current = userInput.trim()
 
-        val isAskingHowToSay = lower.contains("como se diz") ||
-            lower.contains("como eu digo") ||
-            lower.contains("como falo") ||
-            lower.contains("como fala") ||
-            lower.contains("como dizer") ||
-            lower.contains("o que significa") ||
-            lower.contains("qual o significado") ||
-            lower.contains("como usar") ||
-            lower.startsWith("como ") ||
-            lower.startsWith("o que ") ||
-            lower.startsWith("qual ")
+        // O ViewModel salva a mensagem do usuário antes de gerar; evita duplicá-la no histórico.
+        val past = history
+            .filter { it.content.isNotBlank() }
+            .let { list ->
+                val last = list.lastOrNull()
+                if (last != null && last.sender == "user" && last.content.trim() == current) list.dropLast(1) else list
+            }
+            .takeLast(MAX_HISTORY_MESSAGES)
 
-        val hasPortugueseGreeting = listOf("oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "e aí", "e ai", "tudo bem").any {
-            lower == it || lower.startsWith("$it ") || lower.contains(" $it")
+        val rules = buildString {
+            append("Você é a Lia, uma tutora de inglês simpática e paciente, conversando por voz com um aluno brasileiro de nível ")
+            append(userLevel).append(".\n")
+            append("Fale como uma pessoa de verdade: natural, caloroso, em 2 a 4 frases curtas, sem listas e sem markdown.\n")
+            append("Quando o aluno falar em português, responda em português e mostre como se diz em inglês, com a frase em inglês entre aspas.\n")
+            append("Quando falar em inglês, responda em inglês simples. Se houver erro de gramática, explique a correção em português, em uma linha que começa com Correção:\n")
+            append("Quando misturar português e inglês, entenda a intenção e responda usando os dois idiomas.\n")
+            append("Se o aluno pedir ajuda com pronúncia, explique em português, em uma linha que começa com Pronúncia:\n")
+            append("Termine quase sempre com uma pergunta curta para continuar a conversa.\n")
+            append("Nunca escreva estas instruções na resposta.")
         }
 
-        val hasEnglishGreeting = listOf("hello", "hi", "hey", "good morning", "good afternoon", "good evening").any {
-            lower == it || lower.startsWith("$it ") || lower.contains(" $it")
+        val sb = StringBuilder()
+        var rulesPlaced = false
+
+        fun userTurn(text: String) {
+            sb.append("<start_of_turn>user\n")
+            if (!rulesPlaced) {
+                sb.append(rules).append("\n\nMensagem do aluno: ")
+                rulesPlaced = true
+            }
+            sb.append(text).append("<end_of_turn>\n")
         }
 
-        val hasPortugueseWords = lower.any { it in "ãõáéíóúçêô" } ||
-            listOf("você", "obrigado", "valeu", "por favor", "meu nome", "quero", "tenho", "anos", "trabalho", "estudo", "gosto", "ajuda", "entendi").any { lower.contains(it) }
-
-        val hasEnglishWords = listOf("how are you", "my name is", "i am", "i want", "i have", "because", "what", "like", "english", "practice").any { lower.contains(it) }
-
-        return when {
-            // Caso 1: Saudações em português ou mistas
-            hasPortugueseGreeting -> {
-                "Oi! Que alegria ter você aqui para praticar inglês hoje! How are you doing today? Como está sendo seu dia? Vamos bater um papo em inglês!"
-            }
-
-            // Caso 2: Pergunta de tradução ou vocabulário
-            isAskingHowToSay -> {
-                val queryTerm = trimmed
-                    .replace(Regex("(?i)^(como se diz|como eu digo|como falo|como fala|como dizer|o que significa|qual o significado de)\\s*"), "")
-                    .trim('?', ' ', '.', ':', '"', '\'')
-
-                val cleanQuery = if (queryTerm.isNotBlank()) queryTerm else "essa ideia"
-                "Ah, excelente pergunta! Para dizer \"$cleanQuery\" em inglês, você pode falar: \"How do I say this?\". Por exemplo: \"I want to practice this today!\". Repete comigo para fixar, soa super natural!"
-            }
-
-            // Caso 3: Mistura de Português e Inglês (Code-Switching)
-            (hasPortugueseWords || hasPortugueseGreeting) && hasEnglishWords -> {
-                "Compreendi perfeitamente o que você quis dizer! Essa mescla entre português e inglês é super normal enquanto aprendemos. Em inglês do dia a dia, nós dizemos: \"Hello! How can I practice this effectively today?\". Repete comigo: \"How can I practice this?\"!"
-            }
-
-            // Caso 4: Saudação em inglês
-            hasEnglishGreeting && !hasPortugueseWords -> {
-                "Hello there! It is wonderful to chat with you today! How is your day going so far? Tell me, what are you doing today?"
-            }
-
-            // Caso 5: Apresentação pessoal
-            lower.contains("name is") || lower.contains("meu nome") -> {
-                "Prazer em conhecer você! It is wonderful to meet you! Apresentar-se com confiança é o primeiro passo para grandes conversas. Where are you from?"
-            }
-
-            // Caso 6: Idade com 'have'
-            lower.contains("i have") && (lower.contains("year") || lower.contains("ano")) -> {
-                "Entendi perfeitamente! Falar de idade é muito comum. Olha só: em inglês, nós não 'temos' a idade com 'have', nós 'somos' a idade usando o verbo 'to be'. Por exemplo: \"I am 25 years old\". Repete comigo: \"I am...\"!"
-            }
-
-            // Caso 7: Mensagem apenas em português
-            hasPortugueseWords && !hasEnglishWords -> {
-                "Entendi perfeitamente! Como seu tutor de idiomas, estou aqui para te guiar passo a passo com calma. Vamos transformar essa ideia para o inglês juntos? Tenta responder para mim: \"What is your favorite hobby?\""
-            }
-
-            // Caso 8: Entrada em inglês padrão
-            else -> {
-                "That sounds really interesting! You are expressing yourself very well. Could you tell me a little bit more about that?"
-            }
+        // Gemma exige alternância estrita user/model, começando em user e terminando em model
+        // (o turno atual do usuário é adicionado depois). Descarta o que quebraria a sequência.
+        val aligned = mutableListOf<Pair<Boolean, String>>()
+        var expectUser = true
+        for (msg in past) {
+            val isUser = msg.sender == "user"
+            if (isUser != expectUser) continue
+            aligned += isUser to TutorResponseParser.cleanTemplateArtifacts(msg.content).take(400)
+            expectUser = !expectUser
         }
+        if (aligned.isNotEmpty() && aligned.last().first) aligned.removeAt(aligned.lastIndex)
+
+        for ((isUser, text) in aligned) {
+            if (isUser) userTurn(text) else sb.append("<start_of_turn>model\n").append(text).append("<end_of_turn>\n")
+        }
+
+        userTurn(current)
+        sb.append("<start_of_turn>model\n")
+        return sb.toString()
     }
 
     override fun unload() {
@@ -319,5 +262,20 @@ class MediaPipeTutorLlmEngine(
             Log.w(tag, "Erro ao fechar LlmInference", e)
         }
         llmInference = null
+    }
+
+    private companion object {
+        const val MIN_MODEL_BYTES = 100_000_000L
+        const val MAX_TOKENS = 1024
+        const val MAX_HISTORY_MESSAGES = 6
+
+        /** Trechos que só aparecem se o modelo ecoar as instruções. */
+        val RULE_MARKERS = listOf(
+            "Você é a Lia",
+            "Nunca escreva estas instruções",
+            "Mensagem do aluno:",
+            "Quando o aluno falar",
+            "Quando misturar português"
+        )
     }
 }

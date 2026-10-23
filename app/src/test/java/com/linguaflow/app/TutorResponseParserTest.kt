@@ -51,4 +51,16 @@ class TutorResponseParserTest {
         assertTrue(parsed.hasPronunciationTip)
         assertEquals("Em 'juice', o 'j' tem som suave /dʒuːs/.", parsed.pronunciationTip)
     }
+
+    @Test
+    fun testUntaggedCorrecaoAndPronunciaLabels() {
+        val raw = "Boa! Você quase acertou. Tell me more! Correção: \"I have 20 years\" -> \"I am 20 years old\". Pronúncia: 'old' soa como /oʊld/."
+        val parsed = TutorResponseParser.parse(raw)
+
+        assertTrue(parsed.reply.startsWith("Boa!"))
+        assertFalse(parsed.reply.contains("Correção:"))
+        assertTrue(parsed.hasCorrections)
+        assertTrue(parsed.corrections!!.contains("I am 20 years old"))
+        assertTrue(parsed.hasPronunciationTip)
+    }
 }

@@ -125,7 +125,7 @@ fun ChatScreen(
 
     LaunchedEffect(errorMessage) {
         errorMessage?.let { err ->
-            Toast.makeText(context, err, Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, err, Toast.LENGTH_LONG).show()
             viewModel.clearErrorMessage()
         }
     }

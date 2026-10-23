@@ -21,6 +21,10 @@ class SmartSpeechToTextEngine(
 
     private var activeEngine: SpeechToTextEngine = voskEngine
 
+    private companion object {
+        const val USE_WHISPER = false
+    }
+
     init {
         scope.launch {
             whisperEngine.state.collect { if (activeEngine == whisperEngine) _state.value = it }
@@ -37,18 +41,14 @@ class SmartSpeechToTextEngine(
         onFinal: (String, List<WordConfidence>) -> Unit,
         onError: (String) -> Unit
     ) {
-        // Automatic graceful selection: if Whisper ONNX is available locally, use Fase B; else use Fase A (Vosk)
-        activeEngine = if (whisperEngine.isWhisperModelAvailable()) {
-            whisperEngine
-        } else {
-            voskEngine
-        }
+        // O motor Whisper (SherpaWhisperSpeechToTextEngine) ainda é um STUB: não roda o modelo e
+        // devolve texto fixo. Só voltamos a selecioná-lo quando houver transcrição real.
+        activeEngine = if (USE_WHISPER && whisperEngine.isWhisperModelAvailable()) whisperEngine else voskEngine
 
         activeEngine.startListening(
             onPartial = onPartial,
             onFinal = onFinal,
             onError = { err ->
-                // If Whisper failed, gracefully attempt fallback to Vosk
                 if (activeEngine == whisperEngine) {
                     activeEngine = voskEngine
                     voskEngine.startListening(onPartial, onFinal, onError)
@@ -60,10 +60,8 @@ class SmartSpeechToTextEngine(
     }
 
     override fun stopListening() {
+        // Só o motor ativo. Parar os três fazia cada um disparar onFinal e sobrescrever a fala real.
         activeEngine.stopListening()
-        whisperEngine.stopListening()
-        voskEngine.stopListening()
-        _state.value = SttState.Idle
     }
 
     override fun release() {

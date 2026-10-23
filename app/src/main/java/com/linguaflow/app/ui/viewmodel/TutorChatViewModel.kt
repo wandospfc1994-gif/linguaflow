@@ -161,8 +161,9 @@ class TutorChatViewModel(
 
                 // 4. Parser rigoroso com limpeza de tags
                 val finalFeedback: TutorFeedback = TutorResponseParser.parse(fullOutput.toString())
-                val cleanReply = finalFeedback.reply.ifBlank {
-                    "Que ótimo! Vamos continuar praticando. Let's keep talking!"
+                val cleanReply = finalFeedback.reply
+                if (cleanReply.isBlank()) {
+                    throw IllegalStateException("O tutor não gerou uma resposta. Tente de novo.")
                 }
 
                 val storedMetadata = buildString {
@@ -196,7 +197,7 @@ class TutorChatViewModel(
 
             } catch (e: Exception) {
                 Log.e(tag, "Erro no processamento da mensagem do tutor", e)
-                _errorMessage.value = "Erro ao processar resposta: ${e.localizedMessage}"
+                _errorMessage.value = e.localizedMessage ?: "Erro ao gerar a resposta do tutor."
                 _streamingRawText.value = ""
                 _uiState.value = ChatUiState.IDLE
             }
@@ -217,8 +218,12 @@ class TutorChatViewModel(
                 _inputText.value = partial
             },
             onFinal = { text, _ ->
-                val resolved = text.ifBlank { "Hello! How are you?" }
-                _inputText.value = resolved
+                if (text.isBlank()) {
+                    // Nunca inventar texto: avisa que a fala não foi reconhecida.
+                    _errorMessage.value = "Não consegui entender sua voz. Fale perto do microfone e tente de novo."
+                } else {
+                    _inputText.value = text
+                }
                 _uiState.value = ChatUiState.IDLE
             },
             onError = { err ->
@@ -231,15 +236,11 @@ class TutorChatViewModel(
     }
 
     /**
-     * Interrompe a escuta do microfone e restabelece o estado IDLE imediatamente,
-     * garantindo que a caixa de texto seja preenchida caso estivesse vazia.
+     * Interrompe a escuta do microfone e restabelece o estado IDLE imediatamente.
      */
     fun stopListening() {
         sttEngine.stopListening()
         _uiState.value = ChatUiState.IDLE
-        if (_inputText.value.isBlank()) {
-            _inputText.value = "Hello! How are you?"
-        }
     }
 
     fun playTtsForMessage(message: MessageEntity) {
