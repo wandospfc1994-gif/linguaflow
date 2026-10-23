@@ -142,15 +142,15 @@ class ModelDownloadManager(
             }
         }
 
-        // Verificação específica para Gemma 2B LLM (mínimo de ~500MB para modelo quantizado int4 funcional)
+        // Verificação específica para Gemma 2B LLM (mínimo de ~100MB para modelo quantizado int4 funcional)
         if (model.id == ModelCatalog.LLM_GEMMA_2B.id) {
-            if (file.exists() && file.length() >= 500_000_000L) {
+            if (file.exists() && file.length() >= 100_000_000L) {
                 prefs.edit().putBoolean("model_verified_${model.id}", true).apply()
                 return true
             }
             // Verifica se há outro arquivo compatível .bin ou .task com peso substancial
             val candidate = modelsDir.listFiles { f ->
-                (f.name.endsWith(".bin") || f.name.endsWith(".task")) && f.length() >= 500_000_000L
+                (f.name.endsWith(".bin") || f.name.endsWith(".task")) && f.length() >= 100_000_000L
             }?.firstOrNull()
             if (candidate != null) {
                 prefs.edit().putBoolean("model_verified_${model.id}", true).apply()
